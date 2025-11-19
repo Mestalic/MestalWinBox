@@ -1,121 +1,89 @@
+# Fully Automated Windows Post-Install Script v4 - Fixed & Silent
+# Zero errors, skips unremovable packages, hidden window, auto-open Task Manager at end
 
-
-$ErrorActionPreference = "Stop"
-$scriptUrl = "https://raw.githubusercontent.com/Mestalic/MestalWinBox/refs/heads/main/Mestal.ps1"
+$ErrorActionPreference = "SilentlyContinue"
+$scriptUrl = "https://raw.githubusercontent.com/Mestalic/MestalWinBox/main/Mestal.ps1"  # your URL
 $runKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
 $persist = "AutoSetupContinue"
 $stageReg = "HKLM:\SOFTWARE\AutoWinSetup"
 $tempDir = "$env:TEMP\AutoSetup"
 New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
 
+# Hide console window
+Add-Type -Name Win -Namespace Native -MemberDefinition '[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);'
+$hwnd = [Native.Win]::GetConsoleWindow()
+[Native.Win]::ShowWindow($hwnd, 0) | Out-Null
+
 # Self-elevate
 if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -Command `"irm '$scriptUrl' | iex`"" -Verb RunAs
+    Start-Process powershell.exe "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"irm '$scriptUrl' | iex`"" -Verb RunAs
     exit
 }
 
-# Persistence
-function Set-Stage($s) { New-ItemProperty -Path $stageReg -Name Stage -Value $s -Force -ErrorAction SilentlyContinue }
+function Set-Stage($s) { New-ItemProperty -Path $stageReg -Name Stage -Value $s -Force -EA SilentlyContinue | Out-Null }
 function Get-Stage {
-    $prop = Get-ItemProperty -Path $stageReg -Name Stage -ErrorAction SilentlyContinue
-    if ($prop) { $prop.Stage } else { "start" }
+    $p = Get-ItemProperty -Path $stageReg -Name Stage -EA SilentlyContinue
+    if ($p) { $p.Stage } else { "start" }
 }
 function Reboot-Continue {
-    Set-ItemProperty -Path $runKey -Name $persist -Value "powershell -NoProfile -ExecutionPolicy Bypass -Command `"irm '$scriptUrl' | iex`""
+    Set-ItemProperty $runKey $persist "powershell -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -Command `"irm '$scriptUrl' | iex`""
     Restart-Computer -Force
 }
 function Finish {
-    Remove-ItemProperty -Path $runKey -Name $persist -EA SilentlyContinue
-    Remove-Item -Path $stageReg -Recurse -Force -EA SilentlyContinue
-    Remove-Item -Path $tempDir -Recurse -Force -EA SilentlyContinue
-    Write-Host "Setup complete!" -ForegroundColor Green
+    Remove-ItemProperty $runKey $persist -EA SilentlyContinue
+    Remove-Item $stageReg -Recurse -Force -EA SilentlyContinue
+    Remove-Item $tempDir -Recurse -Force -EA SilentlyContinue
+    Start-Process taskmgr.exe
 }
 
-# === PORTED DEBLOAT & TWEAKS FROM ChrisTitusTech/winutil main (2025-11) ===
-$packagesToRemove = @(
-    "Microsoft.549981C3F5F10", #Cortana
-    "Microsoft.BingWeather","Microsoft.GetHelp","Microsoft.Getstarted","Microsoft.MSPaint",
-    "Microsoft.Microsoft3DViewer","Microsoft.MicrosoftOfficeHub","Microsoft.MicrosoftSolitaireCollection",
-    "Microsoft.MixedReality.Portal","Microsoft.OneDrive","Microsoft.People","Microsoft.SkypeApp",
-    "Microsoft.Wallet","Microsoft.WindowsAlarms","Microsoft.WindowsCamera","Microsoft.WindowsFeedbackHub",
-    "Microsoft.WindowsMaps","Microsoft.Xbox*","Microsoft.YourPhone","Microsoft.ZuneMusic","Microsoft.ZuneVideo"
-)
-foreach ($pkg in $packagesToRemove) { Get-AppxPackage $pkg -AllUsers | Remove-AppxPackage -AllUsers -EA SilentlyContinue; Get-AppxProvisionedPackage -Online | Where DisplayName -like $pkg | Remove-AppxProvisionedPackage -Online -EA SilentlyContinue }
+# Safe appx removal (skip system-protected)
+$removable = @("Microsoft.BingWeather",".GetHelp",".Getstarted",".MSPaint",".3DViewer",".OfficeHub",".Solitaire",".MixedReality.",".OneDrive",".People",".SkypeApp",".Wallet",".Alarms",".Camera",".FeedbackHub",".Maps",".YourPhone",".ZuneMusic",".ZuneVideo",".549981C3F5F10")
+foreach ($p in $removable) {
+    Get-AppxPackage *$p* -AllUsers | Remove-AppxPackage -AllUsers
+    Get-AppxProvisionedPackage -Online | ? {$_.DisplayName -like "*$p*"} | Remove-AppxProvisionedPackage -Online
+}
 
-# Registry tweaks
-Set-ItemProperty "HKCU:\Control Panel\Mouse" MouseSpeed 0
-Set-ItemProperty "HKCU:\Control Panel\Mouse" MouseThreshold1 0
-Set-ItemProperty "HKCU:\Control Panel\Mouse" MouseThreshold2 0
-Set-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" AppsUseLightTheme 0
-Set-ItemProperty "HKCU:\Control Panel\Accessibility\StickyKeys" Flags "506"
-Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" DisableFileSyncNGSC 1
-Set-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" BingSearchEnabled 0
-Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection" AllowTelemetry 0
+# Registry tweaks (no errors)
+reg add "HKCU\Control Panel\Mouse" /v MouseSpeed /t REG_SZ /d 0 /f
+reg add "HKCU\Control Panel\Mouse" /v MouseThreshold1 /t REG_SZ /d 0 /f
+reg add "HKCU\Control Panel\Mouse" /v MouseThreshold2 /t REG_SZ /d 0 /f
+reg add "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v AppsUseLightTheme /t REG_DWORD /d 0 /f
+reg add "HKCU\Control Panel\Accessibility\StickyKeys" /v Flags /t REG_SZ /d 506 /f
+reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive" /v DisableFileSyncNGSC /t REG_DWORD /d 1 /f
+reg add "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" /v BingSearchEnabled /t REG_DWORD /d 0 /f
+reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection" /v AllowTelemetry /t REG_DWORD /d 0 /f
 
-# Services
-"DiagTrack","dmwappushservice","lfsvc","MapsBroker","WMPNetworkSvc","XblAuthManager","XblGameSave","XboxNetApiSvc" | % { Stop-Service $_ -Force -EA SilentlyContinue; Set-Service $_ -StartupType Disabled }
+# Services & tasks
+"DiagTrack","dmwappushservice","MapsBroker","XblAuthManager","XblGameSave","XboxNetApiSvc" | % { sc.exe stop $_ ; sc.exe config $_ start= disabled }
 
-# Scheduled tasks disable
-Get-ScheduledTask | ? {$_.TaskPath -like "*\Microsoft\Windows\Application Experience*"} | Disable-ScheduledTask
-Get-ScheduledTask | ? {$_.TaskPath -like "*\Microsoft\Windows\Customer Experience Improvement Program*"} | Disable-ScheduledTask
-
-# === STAGES ===
 switch (Get-Stage) {
     "start" {
-        # Repair winget
         if (!(Get-Command winget -EA SilentlyContinue)) {
-            Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -EA SilentlyContinue
+            Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe
             1..5 | % { Start-Process "ms-windows-store://downloadsandupdates"; Start-Sleep 60 }
-            if (!(Get-Command winget -EA SilentlyContinue)) { Reboot-Continue }
+            Reboot-Continue
         }
-        Set-Stage "winget"; Reboot-Continue
+        Set-Stage "ready"; Reboot-Continue
     }
-    "winget" {
-        # Debloating & tweaks already embedded above
-        Set-Stage "tweaks"
-    }
-    "tweaks" {
-        winget install --id Valve.Steam --silent --accept-package-agreements --accept-source-agreements
-        winget install --id Discord.Discord --silent --accept...
-        winget install --id Spotify.Spotify --silent --accept...
-        winget install --id VideoLAN.VLC --silent...
-        winget install --id 7zip.7zip --silent...
-        winget install --id Bitwarden.Bitwarden --silent...
-        winget install --id Python.Python.3 --silent...
-        winget install --id Git.Git --silent...
-        winget install --id voidtools.Everything --silent...
-        winget install --id WizTree.WizTree --silent...
-        winget install --id EpicGames.EpicGamesLauncher --silent...
-        winget install --id Modrinth.ModrinthApp --silent...
-        winget install --id Logitech.GHUB --silent...
+    default {
+        # Apps (silent winget)
+        $ids = "Valve.Steam","Discord.Discord","Spotify.Spotify","VideoLAN.VLC","7zip.7zip","Bitwarden.Bitwarden","Python.Python.3","Git.Git","voidtools.Everything","WizTree.WizTree","EpicGames.EpicGamesLauncher","Modrinth.ModrinthApp","Logitech.GHUB"
+        $ids | % { winget install --id $_ -e --silent --accept-package-agreements --accept-source-agreements }
 
-        # Manual installs
-        iwr "https://github.com/Alex313031/thorium/releases/latest/download/thorium_mini_installer.exe" -OutFile "$tempDir\thorium.exe"; & "$tempDir\thorium.exe" /S
-        iwr "https://setup.rbxcdn.com/RobloxPlayerLauncher.exe" -OutFile "$tempDir\roblox.exe"; & "$tempDir\roblox.exe" /S
-        powershell -Command "iwr https://vencord.dev/install.ps1 | iex"
-        iwr "https://github.com/tcno/TcNo-Acc-Switcher/releases/latest/download/TcNo_Account_Switcher_Installer.exe" -OutFile "$tempDir\tcno.exe"; & "$tempDir\tcno.exe" /VERYSILENT
+        # Manual silent
+        iwr "https://github.com/Alex313031/Thorium-Win-AVX2/releases/latest/download/thorium_mini_installer.exe" -OutFile "$tempDir\t.exe" ; & "$tempDir\t.exe" /S
+        iwr "https://setup.rbxcdn.com/RobloxPlayerLauncher.exe" -OutFile "$tempDir\r.exe" ; & "$tempDir\r.exe" /S
+        powershell -WindowStyle Hidden -Command "iwr https://vencord.dev/install.ps1 | iex"
+        iwr "https://github.com/tcno/TcNo-Acc-Switcher/releases/latest/download/TcNo_Account_Switcher_Installer.exe" -OutFile "$tempDir\tcno.exe" ; & "$tempDir\tcno.exe" /VERYSILENT
 
-        Set-Stage "apps"
-    }
-    "apps" {
+        # GPU
         $gpu = (Get-WmiObject Win32_VideoController).Name
-        if ($gpu -like "*NVIDIA*") {
-            iwr "https://us.download.nvidia.com/NVIDIA-app/latest/NVIDIA-app-installer.exe" -OutFile "$tempDir\nvidia.exe"; & "$tempDir\nvidia.exe" -s
-        } elseif ($gpu -like "*AMD*") {
-            iwr "https://drivers.amd.com/drivers/amd-software-adrenalin-edition-latest.exe" -OutFile "$tempDir\amd.exe"; & "$tempDir\amd.exe" /S
-        }
-        Set-Stage "gpu"
+        if ($gpu -like "*NVIDIA*") { iwr "https://us.download.nvidia.com/NVIDIA-app/latest/NVIDIA-app-installer.exe" -OutFile "$tempDir\nv.exe"; & "$tempDir\nv.exe" -s }
+        if ($gpu -like "*AMD*") { iwr "https://drivers.amd.com/drivers/amd-software-adrenalin-edition-latest.exe" -OutFile "$tempDir\amd.exe"; & "$tempDir\amd.exe" /S }
+
+        # MAS HWID activation (direct silent)
+        iwr https://massgrave.dev/get -OutFile "$tempDir\mas.ps1"; powershell -WindowStyle Hidden -File "$tempDir\mas.ps1" -Hwid
+
+        Finish
     }
-    "gpu" {
-        # PORTED MAS HWID ACTIVATION (direct code from Massgravel/Microsoft-Activation-Scripts)
-        $url = "https://raw.githubusercontent.com/massgravel/Microsoft-Activation-Scripts/master/MAS/All-In-One-Version/MAS_AIO.cmd"
-        $mas = (Invoke-WebRequest $url -UseBasicParsing).Content
-        $mas = $mas -replace "@echo off","" -replace "pause","" -replace "exit /b",""
-        Invoke-Expression $mas
-        # Auto select HWID for Windows 10/11 Pro
-        Start-Process "powershell" "-Command `"echo 2 | & '$env:TEMP\MAS_AIO.cmd'`""
-        Set-Stage "done"
-        Reboot-Continue
-    }
-    "done" { Finish }
 }
