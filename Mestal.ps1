@@ -16,7 +16,10 @@ if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]:
 
 # Persistence
 function Set-Stage($s) { New-ItemProperty -Path $stageReg -Name Stage -Value $s -Force -ErrorAction SilentlyContinue }
-function Get-Stage { (Get-ItemProperty -Path $stageReg -Name Stage -EA SilentlyContinue).Stage ?? "start" }
+function Get-Stage {
+    $prop = Get-ItemProperty -Path $stageReg -Name Stage -ErrorAction SilentlyContinue
+    if ($prop) { $prop.Stage } else { "start" }
+}
 function Reboot-Continue {
     Set-ItemProperty -Path $runKey -Name $persist -Value "powershell -NoProfile -ExecutionPolicy Bypass -Command `"irm '$scriptUrl' | iex`""
     Restart-Computer -Force
