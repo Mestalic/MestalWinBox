@@ -1,8 +1,7 @@
-# Fully Automated Windows Post-Install Script v3 - Self-Contained (No external irm except downloads)
-# Run: irm https://yourhost/raw/auto-setup.ps1 | iex   (host this full script)
+
 
 $ErrorActionPreference = "Stop"
-$scriptUrl = "https://yourhost/raw/auto-setup.ps1"  # CHANGE ME
+$scriptUrl = "https://raw.githubusercontent.com/Mestalic/MestalWinBox/refs/heads/main/Mestal.ps1"
 $runKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
 $persist = "AutoSetupContinue"
 $stageReg = "HKLM:\SOFTWARE\AutoWinSetup"
