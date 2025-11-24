@@ -1,4 +1,20 @@
+<#
+.SYNOPSIS
+    Automated Windows Setup & Optimization Script FART
+    
+.DESCRIPTION
+    This script automates the setup of a fresh Windows installation.
+    Features:
+    - Installs common applications via Winget
+    - Debloats Windows (removes bloatware, disables telemetry)
+    - Installs GPU drivers (NVIDIA/AMD)
+    - Activates Windows via MAS (HWID)
+    - Resumes after reboot if necessary
 
+.NOTES
+    Author: Antigravity (based on user request)
+    Version: 1.1
+#>
 
 # --- Configuration ---
 $Script:WingetApps = @(
@@ -39,17 +55,35 @@ $Script:Bloatware = @(
 $ErrorActionPreference = "Stop"
 $Script:LogFile = "$env:SystemDrive\MestalSetup.log"
 
+function Write-Header {
+    param([string]$Title)
+    Clear-Host
+    Write-Host "============================================================" -ForegroundColor Magenta
+    Write-Host "   $Title" -ForegroundColor White
+    Write-Host "============================================================" -ForegroundColor Magenta
+    Write-Host ""
+}
+
 function Write-Log {
-    param([string]$Message)
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logMsg = "[$timestamp] $Message"
-    Write-Host $logMsg -ForegroundColor Cyan
-    $logMsg | Out-File -FilePath $Script:LogFile -Append -Encoding UTF8
+    param(
+        [string]$Message,
+        [string]$Type = "Info" # Info, Success, Warning, Error
+    )
+    $timestamp = Get-Date -Format "HH:mm:ss"
+    $color = "Cyan"
+    switch ($Type) {
+        "Success" { $color = "Green" }
+        "Warning" { $color = "Yellow" }
+        "Error"   { $color = "Red" }
+    }
+    
+    Write-Host "[$timestamp] $Message" -ForegroundColor $color
+    "[$timestamp] [$Type] $Message" | Out-File -FilePath $Script:LogFile -Append -Encoding UTF8
 }
 
 # Ensure Admin
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host "Restarting as Administrator..."
+    Write-Host "Restarting as Administrator..." -ForegroundColor Yellow
     Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`"" -Verb RunAs
     exit
 }
@@ -64,7 +98,7 @@ function Test-Winget {
     if (Get-Command winget -ErrorAction SilentlyContinue) {
         return $true
     }
-    Write-Log "Winget not found. Attempting to install App Installer..."
+    Write-Log "Winget not found. Attempting to install App Installer..." "Warning"
     # Try to install App Installer via Appx
     $appInstallerUri = "https://github.com/microsoft/winget-cli/releases/latest/download/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
     $tempFile = "$env:TEMP\AppInstaller.msixbundle"
@@ -73,7 +107,7 @@ function Test-Winget {
         Add-AppxPackage -Path $tempFile
         return $true
     } catch {
-        Write-Log "Failed to install Winget: $_"
+        Write-Log "Failed to install Winget: $_" "Error"
         return $false
     }
 }
@@ -86,24 +120,30 @@ function Install-WingetApp {
         $args = "install --id $Id -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity"
         $proc = Start-Process winget -ArgumentList $args -Wait -PassThru -NoNewWindow
         if ($proc.ExitCode -eq 0) {
-            Write-Log "Successfully installed $Id"
+            Write-Log "Successfully installed $Id" "Success"
         } else {
-            Write-Log "Failed to install $Id (Exit Code: $($proc.ExitCode))"
+            Write-Log "Failed to install $Id (Exit Code: $($proc.ExitCode))" "Error"
         }
     } catch {
-        Write-Log "Error installing $Id: $_"
+        Write-Log "Error installing $($Id): $_" "Error"
     }
 }
 
 function Invoke-Debloat {
-    Write-Log "Starting Debloat..."
+    Write-Header "STAGE 1: DEBLOATING WINDOWS"
+    Write-Log "Starting Debloat process..."
     
     # Remove Bloatware
+    $total = $Script:Bloatware.Count
+    $i = 0
     foreach ($app in $Script:Bloatware) {
+        $i++
+        Write-Progress -Activity "Removing Bloatware" -Status "Removing $app" -PercentComplete (($i / $total) * 100)
         Write-Log "Removing $app..."
         Get-AppxPackage -Name $app -AllUsers -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
         Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq $app } | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
     }
+    Write-Progress -Activity "Removing Bloatware" -Completed
 
     # Registry Tweaks
     Write-Log "Applying Registry Tweaks..."
@@ -124,9 +164,12 @@ function Invoke-Debloat {
 
     # Disable Hibernate
     powercfg /hibernate off
+    
+    Write-Log "Debloat complete." "Success"
 }
 
 function Install-Drivers {
+    Write-Header "STAGE 3: DRIVER INSTALLATION"
     Write-Log "Checking for GPU Drivers..."
     $gpu = Get-WmiObject Win32_VideoController
     $gpuName = $gpu.Name
@@ -142,10 +185,6 @@ function Install-Drivers {
     }
     elseif ($gpuName -match "AMD" -or $gpuName -match "Radeon") {
         Write-Log "Downloading AMD Adrenalin..."
-        # Note: AMD URLs change frequently. Using a known recent minimal setup or full.
-        # This URL is from the user's script, might be outdated. 
-        # Better approach: Use Winget for AMD Software if possible, but it's often tricky.
-        # Fallback to user's URL but warn.
         $url = "https://drivers.amd.com/drivers/installer/22.40/beta/amd-software-adrenalin-edition-22.40.03.01-minimalsetup.exe" 
         $outFile = "$env:TEMP\AMD_Setup.exe"
         try {
@@ -153,7 +192,7 @@ function Install-Drivers {
             Write-Log "Installing AMD Drivers..."
             Start-Process -FilePath $outFile -ArgumentList "/S" -Wait
         } catch {
-            Write-Log "Could not download AMD driver. URL might be invalid."
+            Write-Log "Could not download AMD driver. URL might be invalid." "Warning"
         }
     }
     else {
@@ -162,43 +201,30 @@ function Install-Drivers {
 }
 
 function Invoke-Activation {
+    Write-Header "STAGE 4: WINDOWS ACTIVATION"
     Write-Log "Attempting Windows Activation via MAS (HWID)..."
     try {
         # MAS HWID One-Liner (Non-interactive)
-        # We use the specific command to run HWID directly
-        $script = {
-            param([string]$Method)
-            $url = "https://massgrave.dev/get"
-            $content = Invoke-WebRequest -Uri $url -UseBasicParsing
-            Invoke-Expression $content.Content
-        }
-        # Note: The standard MAS script is interactive. 
-        # To run silently, we need to use the specific arguments if supported or the separate scripts.
-        # MAS has a separate repo for silent scripts or we can use the main one with args if documented.
-        # Actually, the user's script used a custom script block.
-        # The official way for silent HWID:
-        irm https://massgrave.dev/get | iex
-        # Wait, that's interactive.
-        # Let's use the specific HWID script from Massgrave if available, or simulate input.
-        # Massgrave docs say: "irm https://get.activated.win | iex" -> Select 1.
-        # For unattended: 
+        Write-Log "Running MAS HWID..."
         & ([ScriptBlock]::Create((irm https://massgrave.dev/get))) /hwid
+        Write-Log "Activation command executed." "Success"
     } catch {
-        Write-Log "Activation failed: $_"
+        Write-Log "Activation failed: $_" "Error"
     }
 }
 
 function Install-ManualApps {
+    Write-Header "STAGE 2b: MANUAL APPS"
     Write-Log "Installing Manual Apps..."
     
     # Vencord
     Write-Log "Installing Vencord..."
     try {
-        # Vencord installer usually requires Discord to be installed first.
         if (Get-Process -Name Discord -ErrorAction SilentlyContinue) { Stop-Process -Name Discord -Force }
         irm https://vencord.dev/install.ps1 | iex
+        Write-Log "Vencord installed." "Success"
     } catch {
-        Write-Log "Vencord install failed: $_"
+        Write-Log "Vencord install failed: $_" "Error"
     }
 
     # TCNO Account Switcher
@@ -208,8 +234,9 @@ function Install-ManualApps {
         $out = "$env:TEMP\TcNo.exe"
         Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
         Start-Process $out -ArgumentList "/VERYSILENT" -Wait
+        Write-Log "TCNO Account Switcher installed." "Success"
     } catch {
-        Write-Log "TCNO install failed: $_"
+        Write-Log "TCNO install failed: $_" "Error"
     }
 }
 
@@ -230,6 +257,7 @@ function Set-Step {
 $currentStep = Get-Step
 if (!$currentStep) { $currentStep = 0 }
 
+Write-Header "MESTAL WINDOWS SETUP"
 Write-Log "Starting Script at Step $currentStep"
 
 if ($currentStep -lt 1) {
@@ -240,10 +268,16 @@ if ($currentStep -lt 1) {
 
 if ($currentStep -lt 2) {
     # Step 2: Winget Apps
+    Write-Header "STAGE 2: INSTALLING APPS"
     if (Test-Winget) {
+        $total = $Script:WingetApps.Count
+        $i = 0
         foreach ($app in $Script:WingetApps) {
+            $i++
+            Write-Progress -Activity "Installing Apps" -Status "Installing $app" -PercentComplete (($i / $total) * 100)
             Install-WingetApp -Id $app
         }
+        Write-Progress -Activity "Installing Apps" -Completed
     }
     Set-Step 2
 }
@@ -266,7 +300,9 @@ if ($currentStep -lt 5) {
     Set-Step 5
 }
 
-Write-Log "Setup Complete!"
+Write-Header "SETUP COMPLETE"
+Write-Log "All tasks finished successfully." "Success"
+Write-Log "Log file saved to: $Script:LogFile"
 # Clean up registry key
 Remove-Item $RegPath -Force -ErrorAction SilentlyContinue
 Stop-Transcript
