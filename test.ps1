@@ -1,20 +1,4 @@
-<#
-.SYNOPSIS
-    Automated Windows Setup & Optimization Script
-    
-.DESCRIPTION
-    This script automates the setup of a fresh Windows installation.
-    Features:
-    - Installs common applications via Winget
-    - Debloats Windows (removes bloatware, disables telemetry)
-    - Installs GPU drivers (NVIDIA/AMD)
-    - Activates Windows via MAS (HWID)
-    - Resumes after reboot if necessary
 
-.NOTES
-    Author: Antigravity (based on user request)
-    Version: 1.0
-#>
 
 # --- Configuration ---
 $Script:WingetApps = @(
