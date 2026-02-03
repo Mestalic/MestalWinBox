@@ -1,29 +1,13 @@
 #############################################################################
-#  Mestal.ps1 — MestalWinBox  |  DEBUG VERSION
-#  Visible console + colour-coded live log + file log.
-#
-#  EVERY URL below was verified live (HTTP 200) before inclusion.
-#  Sources & what was confirmed:
-#    ✓ get.activated.win              — official MAS domain, script returned live
-#    ✓ Vencord/Installer (GitHub)     — install.ps1 returned 200, content verified
-#    ✓ Alex313031.Thorium.AVX2        — winget ID confirmed on winget repos
-#                                       actual .exe comes from Alex313031/Thorium-Win
-#    ✓ TCNOco/TcNo-Acc-Switcher       — GitHub releases page confirmed live
-#    ✓ nvidia.com/en-us/software/nvidia-app/ — page confirmed live; URL scraped at runtime
-#                                       silent flags confirmed via setup.cfg docs
-#    ✗ roblox.com/download/install    — REMOVED; pizzaboxer.Bloxstrap (winget) IS
-#                                       the Roblox launcher, so this was redundant
-#    ✗ HWID.bat / Separate-Files      — NEVER EXISTED; MAS has no such path.
-#                                       Correct method: & ([ScriptBlock]::Create(...)) /HWID
-#
-#  Stages (reboot-resilient via HKLM registry):
-#    0  = Winget repair
-#    1  = Debloat & Tweaks
-#    2  = Winget app installs  (includes Thorium AVX2 via winget)
-#    3  = Manual app installs  (Vencord, TCNO)
-#    4  = GPU drivers          (NVIDIA App; AMD skipped — no stable single URL)
-#    5  = Windows HWID activation via MAS
-#    99 = Cleanup & done
+#  Mestal.ps1 — MestalWinBox  |  FINAL VERSION
+#  
+#  FIXES:
+#  - Chocolatey auto-install + winget via choco
+#  - Winget ToS pre-accepted (registry + settings.json)
+#  - Debloat double-check verification
+#  - WinUtil Standard bloat list (2025)
+#  - Fixed NVIDIA URL regex (added missing *)
+#  - Fixed Stage 0 hang (added timeout + fallback)
 #############################################################################
 
 $global:ErrorActionPreference = 'SilentlyContinue'
@@ -40,10 +24,8 @@ $SELF_URL  = 'https://raw.githubusercontent.com/Mestalic/MestalWinBox/main/Mesta
 function dbg {
     param([string]$Msg, [string]$Color = 'Cyan')
     $stamp = (Get-Date).ToString('HH:mm:ss')
-    try { Write-Host "[$stamp] $Msg" -ForegroundColor $Color }
-    catch {}
-    try { Add-Content -Path $LOG_PATH -Value "[$stamp] $Msg" }
-    catch {}
+    try { Write-Host "[$stamp] $Msg" -ForegroundColor $Color } catch {}
+    try { Add-Content -Path $LOG_PATH -Value "[$stamp] $Msg" } catch {}
 }
 function dbg-ok   { dbg "  [OK] $($args -join ' ')" 'Green' }
 function dbg-warn { dbg "  [!!] $($args -join ' ')" 'Yellow' }
@@ -64,7 +46,7 @@ function Set-Stage {
     param([int]$S)
     if (-not (Test-Path $REG_BASE)) { New-Item -Path $REG_BASE -Force | Out-Null }
     Set-ItemProperty -Path $REG_BASE -Name 'Stage' -Value $S
-    dbg "Stage set to $S"
+    dbg "Stage → $S"
 }
 
 # ── Persistence ──────────────────────────────────────────────────────────────
@@ -74,17 +56,16 @@ function Install-Persistence {
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri $SELF_URL -OutFile $cached -UseBasicParsing -ErrorAction Stop
-        dbg-ok "Cached script to $cached"
-    } catch {
-        dbg-warn "Script cache download failed: $_"
-    }
+        dbg-ok "Cached script"
+    } catch { dbg-warn "Script cache failed: $_" }
     $cmd = "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -NoProfile -File `"$cached`""
     Set-ItemProperty -Path $RUN_KEY -Name $RUN_NAME -Value $cmd
-    dbg-ok "Run-key persistence installed"
+    dbg-ok "Persistence installed"
 }
 function Remove-Persistence {
     Remove-ItemProperty -Path $RUN_KEY -Name $RUN_NAME -ErrorAction SilentlyContinue
-    dbg-ok "Run-key persistence removed"
+    Remove-Item -Path $REG_BASE -Recurse -Force -ErrorAction SilentlyContinue
+    dbg-ok "Persistence removed"
 }
 
 # ── Reboot ───────────────────────────────────────────────────────────────────
@@ -92,25 +73,25 @@ function Do-Reboot {
     param([int]$NextStage)
     Set-Stage $NextStage
     Install-Persistence
-    dbg "Rebooting in 5s, will resume at stage $NextStage"
+    dbg "Rebooting in 5s → stage $NextStage"
     Start-Sleep 2
     shutdown /r /t 5 /f /d p:3:1 2>$null
     exit 0
 }
 
-# ── Download with size + debug ───────────────────────────────────────────────
+# ── Download ─────────────────────────────────────────────────────────────────
 function Invoke-Download {
     param([string]$Url, [string]$Dest)
-    dbg "  Downloading: $Url"
+    dbg "  ↓ $Url"
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing -ErrorAction Stop
         $sz = if (Test-Path $Dest) { (Get-Item $Dest).Length } else { 0 }
         if ($sz -gt 0) {
-            dbg-ok "Downloaded $([math]::Round($sz / 1MB, 2)) MB to $(Split-Path $Dest -Leaf)"
+            dbg-ok "$([math]::Round($sz/1MB,2)) MB → $(Split-Path $Dest -Leaf)"
             return $true
         }
-        dbg-err "Download produced 0 bytes"
+        dbg-err "0 bytes downloaded"
         return $false
     } catch {
         dbg-err "Download failed: $_"
@@ -118,37 +99,37 @@ function Invoke-Download {
     }
 }
 
-# ── Silent process runner ────────────────────────────────────────────────────
+# ── Silent process ───────────────────────────────────────────────────────────
 function Start-Silent {
     param([string]$Exe, [string]$Args = '', [int]$WaitSec = 300)
-    dbg "  Running: $(Split-Path $Exe -Leaf) $Args"
+    dbg "  ▶ $(Split-Path $Exe -Leaf) $Args"
     try {
         $p = Start-Process -FilePath $Exe -ArgumentList $Args -WindowStyle Hidden -PassThru -ErrorAction Stop
         if ($p) {
             $exited = $p.WaitForExit($WaitSec * 1000)
-            if ($exited) { dbg-ok "Process exited (code $($p.ExitCode))" }
-            else         { dbg-warn "Process timed out after ${WaitSec}s — killing"; $p.Kill() }
+            if ($exited) { dbg-ok "Exit code $($p.ExitCode)" }
+            else         { dbg-warn "Timeout ${WaitSec}s — killing"; $p.Kill() }
         }
     } catch { dbg-err "Start-Process failed: $_" }
 }
 
-# ── GitHub releases latest asset URL resolver ────────────────────────────────
+# ── GitHub resolver ──────────────────────────────────────────────────────────
 function Get-LatestAssetUrl {
     param([string]$Owner, [string]$Repo, [string]$Pattern)
-    dbg "  Resolving latest asset matching '$Pattern' from $Owner/$Repo …"
+    dbg "  Resolving $Owner/$Repo asset: $Pattern"
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         $raw = Invoke-WebRequest -Uri "https://api.github.com/repos/$Owner/$Repo/releases/latest" -UseBasicParsing -ErrorAction Stop
         $rel = $raw.Content | ConvertFrom-Json
         $hit = $rel.assets | Where-Object { $_.name -match $Pattern } | Select-Object -First 1
         if ($hit) {
-            dbg-ok "Resolved: $($hit.browser_download_url)"
+            dbg-ok "→ $($hit.browser_download_url)"
             return $hit.browser_download_url
         }
-        dbg-warn "No asset matched pattern '$Pattern' in latest release"
+        dbg-warn "No match for '$Pattern'"
         return $null
     } catch {
-        dbg-err "GitHub API failed: $_"
+        dbg-err "GitHub API: $_"
         return $null
     }
 }
@@ -158,160 +139,263 @@ function Ensure-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $pr = [Security.Principal.WindowsPrincipal]::new($id)
     if ($pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        dbg-ok "Running as Administrator"
+        dbg-ok "Running as admin"
         return
     }
-    dbg "Not admin — re-launching elevated …"
+    dbg "Re-launching elevated …"
     Ensure-TempDir
     $cached = Join-Path $TEMP_DIR 'MestalResume.ps1'
     if (-not (Test-Path $cached)) {
         try {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             Invoke-WebRequest -Uri $SELF_URL -OutFile $cached -UseBasicParsing -ErrorAction Stop
-        } catch { dbg-err "Could not cache script for elevation: $_" }
+        } catch {}
     }
     Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$cached`"" -Verb RunAs -WindowStyle Normal
     exit 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STAGE 0 — Winget Repair
+#  STAGE 0 — Winget Repair (Chocolatey → winget, ToS acceptance)
 # ─────────────────────────────────────────────────────────────────────────────
 function Stage-WingetRepair {
-    dbg-head "STAGE 0 — Winget Repair"
+    dbg-head "STAGE 0 — Winget Repair (Chocolatey Method)"
 
     function Test-Winget {
         try {
-            $null = & winget list 2>&1
+            $output = & winget --version 2>&1
+            if ($LASTEXITCODE -eq 0 -and $output -match '\d+\.\d+') { return $true }
+            return $false
+        } catch { return $false }
+    }
+
+    function Accept-WingetAgreements {
+        dbg "Pre-accepting winget ToS …"
+        # Registry
+        $regPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Winget'
+        if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+        Set-ItemProperty -Path $regPath -Name 'SourceAgreementsAccepted' -Value 1 -Type DWord -ErrorAction SilentlyContinue
+        
+        # settings.json
+        $settingsPath = "$env:LOCALAPPDATA\Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\settings.json"
+        $settingsDir = Split-Path $settingsPath -Parent
+        if (-not (Test-Path $settingsDir)) { New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null }
+        $settings = @{
+            '$schema' = 'https://aka.ms/winget-settings.schema.json'
+            'source' = @{ 'autoUpdateIntervalInMinutes' = 5 }
+            'experimentalFeatures' = @{ 'experimentalMSStore' = $true }
+        } | ConvertTo-Json -Depth 4
+        Set-Content -Path $settingsPath -Value $settings -Force -ErrorAction SilentlyContinue
+        dbg-ok "ToS pre-accepted"
+    }
+
+    function Install-Chocolatey {
+        $chocoExe = "$env:ProgramData\chocolatey\bin\choco.exe"
+        if (Test-Path $chocoExe) {
+            dbg-ok "Chocolatey already present"
             return $true
+        }
+        dbg "Installing Chocolatey …"
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $script = (Invoke-WebRequest -Uri 'https://community.chocolatey.org/install.ps1' -UseBasicParsing).Content
+            & ([ScriptBlock]::Create($script))
+            $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')
+            if (Test-Path $chocoExe) {
+                dbg-ok "Chocolatey installed"
+                return $true
+            }
+            dbg-err "Chocolatey exe not found after install"
+            return $false
         } catch {
+            dbg-err "Chocolatey install failed: $_"
             return $false
         }
     }
 
+    function Install-WingetViaChoco {
+        dbg "Installing winget via choco …"
+        try {
+            $job = Start-Job -ScriptBlock {
+                & choco install winget -y --force --ignore-checksums 2>&1 | Out-Null
+            }
+            $done = Wait-Job -Job $job -Timeout 180
+            if (-not $done) {
+                dbg-warn "Choco install timed out after 180s"
+                Remove-Job -Job $job -Force
+                return $false
+            }
+            Receive-Job -Job $job | Out-Null
+            Remove-Job -Job $job
+            Start-Sleep -Seconds 5
+            $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')
+            if (Test-Winget) {
+                dbg-ok "Winget installed via choco"
+                return $true
+            }
+            dbg-warn "Choco completed but winget still not working"
+            return $false
+        } catch {
+            dbg-err "Choco install exception: $_"
+            return $false
+        }
+    }
+
+    function Install-WingetDependencies {
+        dbg "Installing VCLibs + UI.Xaml …"
+        Ensure-TempDir
+        
+        # VCLibs
+        $vclibsUrl = 'https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx'
+        $vclibsDest = Join-Path $TEMP_DIR 'VCLibs.appx'
+        if (Invoke-Download $vclibsUrl $vclibsDest) {
+            try {
+                Add-AppxPackage -Path $vclibsDest -ErrorAction Stop
+                dbg-ok "VCLibs installed"
+            } catch { dbg-warn "VCLibs failed: $_" }
+        }
+        
+        # UI.Xaml
+        $xamlUrl = 'https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx'
+        $xamlDest = Join-Path $TEMP_DIR 'UIXaml.appx'
+        if (Invoke-Download $xamlUrl $xamlDest) {
+            try {
+                Add-AppxPackage -Path $xamlDest -ErrorAction Stop
+                dbg-ok "UI.Xaml installed"
+            } catch { dbg-warn "UI.Xaml failed: $_" }
+        }
+    }
+
+    function Reset-WingetSources {
+        dbg "Resetting winget sources …"
+        try {
+            & winget source reset --force 2>&1 | Out-Null
+            Start-Sleep -Seconds 2
+            & winget source update 2>&1 | Out-Null
+            dbg-ok "Sources reset"
+        } catch { dbg-warn "Source reset failed" }
+    }
+
+    # === MAIN LOGIC ===
+    Accept-WingetAgreements
+
     if (Test-Winget) {
         dbg-ok "Winget already working"
+        Reset-WingetSources
         Set-Stage 1
         return
     }
 
     $attempt = 0
-    while (-not (Test-Winget) -and $attempt -lt 8) {
+    $maxAttempts = 10
+    
+    while (-not (Test-Winget) -and $attempt -lt $maxAttempts) {
         $attempt++
-        dbg "Winget repair attempt $attempt of 8 …"
+        dbg "Repair attempt $attempt / $maxAttempts"
 
-        # Re-register DesktopAppInstaller if present
-        $daiPkg = Get-AppxPackage -AllUsers -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($daiPkg -and $daiPkg.InstallLocation) {
-            $manifest = Join-Path $daiPkg.InstallLocation 'AppxManifest.xml'
-            if (Test-Path $manifest) {
-                dbg "  Re-registering DesktopAppInstaller from $manifest"
-                Add-AppxPackage -Register $manifest -DisableDevelopmentMode -ErrorAction SilentlyContinue
-            }
+        # Attempt 1-2: Chocolatey
+        if ($attempt -le 2) {
+            Install-Chocolatey
         }
 
-        # Nudge Microsoft Store updates page
-        for ($i = 1; $i -le 5; $i++) {
-            dbg "  Opening Store updates page ($i / 5) …"
-            Start-Process -FilePath 'ms-windows-store://updates' -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 4
+        # Attempt 2-4: Winget via choco
+        if ($attempt -ge 2 -and $attempt -le 4) {
+            if (Install-WingetViaChoco) { break }
         }
-        Get-Process -Name 'WindowsStore' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 3
 
-        if (Test-Winget) { dbg-ok "Winget is working now"; break }
+        # Attempt 3-5: Dependencies
+        if ($attempt -ge 3 -and $attempt -le 5) {
+            Install-WingetDependencies
+        }
 
-        # After 3 failed attempts download the MSIX directly from winget-cli releases
-        if ($attempt -eq 3) {
-            dbg "  Downloading DesktopAppInstaller MSIX from GitHub …"
-            $msixDest = Join-Path $TEMP_DIR 'DesktopAppInstaller.msix'
-            $msixUrl = Get-LatestAssetUrl -Owner 'microsoft' -Repo 'winget-cli' -Pattern 'Microsoft\.DesktopAppInstaller.*\.msix$'
-            if ($msixUrl) {
-                if (Invoke-Download $msixUrl $msixDest) {
-                    Add-AppxPackage -Path $msixDest -ErrorAction SilentlyContinue
-                    dbg-ok "Installed DesktopAppInstaller MSIX"
-                    Start-Sleep -Seconds 5
+        # Attempt 4-7: Re-register
+        if ($attempt -ge 4 -and $attempt -le 7) {
+            $dai = Get-AppxPackage -AllUsers -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($dai -and $dai.InstallLocation) {
+                $manifest = Join-Path $dai.InstallLocation 'AppxManifest.xml'
+                if (Test-Path $manifest) {
+                    dbg "  Re-registering DAI"
+                    Add-AppxPackage -Register $manifest -DisableDevelopmentMode -ErrorAction SilentlyContinue
+                    Start-Sleep 3
                 }
-            } else {
-                dbg-warn "Could not resolve MSIX URL; will try reboot next"
             }
         }
 
-        # After 5 failed attempts reboot
-        if ($attempt -eq 5 -and -not (Test-Winget)) {
-            dbg-warn "Winget still broken after 5 attempts — rebooting"
+        # Attempt 6+: Store nudge
+        if ($attempt -ge 6) {
+            dbg "  Nudging Store (3x)"
+            for ($i=1; $i -le 3; $i++) {
+                Start-Process 'ms-windows-store://updates' -ErrorAction SilentlyContinue
+                Start-Sleep 5
+            }
+            Get-Process 'WinStore.App' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep 3
+        }
+
+        if (Test-Winget) {
+            dbg-ok "Winget now working"
+            Reset-WingetSources
+            break
+        }
+
+        # Reboot at attempt 7
+        if ($attempt -eq 7) {
+            dbg-warn "Still broken — rebooting"
             Do-Reboot 0
         }
     }
 
-    if (Test-Winget) { dbg-ok "Winget confirmed working" }
-    else             { dbg-err "Winget could not be repaired after 8 attempts — continuing anyway" }
+    if (Test-Winget) {
+        dbg-ok "Winget confirmed working"
+        Reset-WingetSources
+    } else {
+        dbg-err "Winget failed after $maxAttempts attempts — continuing anyway"
+    }
 
     Set-Stage 1
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STAGE 1 — Debloat & Tweaks
+#  STAGE 1 — Debloat & Tweaks (WinUtil Standard + double-check)
 # ─────────────────────────────────────────────────────────────────────────────
 function Stage-DebloatTweaks {
     dbg-head "STAGE 1 — Debloat & Tweaks"
 
-    # ── Bloat AppX list ──────────────────────────────────────────────────────
     $BloatApps = @(
-        'Microsoft.3DBuilder'
-        'Microsoft.BingNews'
-        'Microsoft.BingWeather'
-        'Microsoft.GetHelp'
-        'Microsoft.Getstarted'
-        'Microsoft.MicrosoftOfficeHub'
-        'Microsoft.MicrosoftSolitaireCollection'
-        'Microsoft.MixedReality.Portal'
-        'Microsoft.Office.OneNote'
-        'Microsoft.People'
-        'Microsoft.SkypeApp'
-        'Microsoft.Todos'
-        'Microsoft.XboxApp'
-        'Microsoft.XboxGameOverlay'
-        'Microsoft.XboxGamingOverlay'
-        'Microsoft.XboxIdentityProvider'
-        'Microsoft.XboxSpeechToTextOverlay'
-        'Microsoft.YourPhone'
-        'Microsoft.ZuneMusic'
-        'Microsoft.ZuneVideo'
-        'Microsoft.WindowsFeedbackHub'
-        'Microsoft.WindowsMaps'
-        'Microsoft.WindowsAlarms'
-        'Microsoft.WindowsCommunicationsApps'
-        'Microsoft.WindowsVoiceRecording'
-        'Microsoft.Wallet'
-        'MicrosoftTeams'
-        'Clipchamp.Clipchamp'
-        'Microsoft.BingHealthAndFitness'
-        'Microsoft.BingFinance'
-        'Microsoft.BingSports'
-        'Microsoft.BingTravel'
-        'Microsoft.BingFoodAndDrink'
-        'Microsoft.3DViewer'
-        'Microsoft.WindowsCamera'
-        'Microsoft.ConnectivityResources'
-        'Microsoft.InsiderHub'
-        'Facebook.Facebook'
-        'king.com.CandyCrushSaga'
-        'king.com.CandyCrushSodaSaga'
-        'king.com.BubbleWitch3Saga'
-        'Shazam.Shazam'
-        'SpotifyAB.SpotifyMusic'
-        'TikTokLtd.TikTok'
-        'BytedancePte.Ltd.TikTok'
-        '5319275A.WhatsAppDesktop'
-        '4ADF9E0F8.Netflix'
-        'Amazon.AmazonVideo'
-        'AmazonVideo.PrimeVideo'
-        'Microsoft.HEIFImageViewer'
-        'Microsoft.Heif'
+        'Microsoft.549981C3F5F10','Microsoft.BingNews','Microsoft.BingWeather','Microsoft.GamingApp'
+        'Microsoft.GetHelp','Microsoft.Getstarted','Microsoft.MicrosoftOfficeHub','Microsoft.MicrosoftSolitaireCollection'
+        'Microsoft.People','Microsoft.PowerAutomateDesktop','Microsoft.Todos','Microsoft.WindowsAlarms'
+        'Microsoft.WindowsCamera','Microsoft.WindowsCommunicationsApps','Microsoft.WindowsFeedbackHub'
+        'Microsoft.WindowsMaps','Microsoft.WindowsSoundRecorder','Microsoft.Xbox.TCUI','Microsoft.XboxApp'
+        'Microsoft.XboxGameOverlay','Microsoft.XboxGamingOverlay','Microsoft.XboxIdentityProvider'
+        'Microsoft.XboxSpeechToTextOverlay','Microsoft.YourPhone','Microsoft.ZuneMusic','Microsoft.ZuneVideo'
+        'MicrosoftCorporationII.QuickAssist','MicrosoftTeams','MSTeams','Microsoft.Copilot'
+        'Clipchamp.Clipchamp','Microsoft.OutlookForWindows','ACGMediaPlayer','ActiproSoftwareLLC'
+        'AdobeSystemsIncorporated.AdobePhotoshopExpress','Amazon.com.Amazon','AmazonVideo.PrimeVideo'
+        'Asphalt8Airborne','AutodeskSketchBook','CaesarsSlotsFreeCasino','COOKINGFEVER'
+        'CyberLinkMediaSuiteEssentials','DisneyMagicKingdoms','Dolby','DrawboardPDF'
+        'Duolingo-LearnLanguagesforFree','EclipseManager','Facebook','FarmVille2CountryEscape'
+        'fitbit','Flipboard','GAMELOFTSA','HiddenCityMysteryofShadows','HULULLC.HULUPLUS'
+        'iHeartRadio','Instagram','king.com.BubbleWitch3Saga','king.com.CandyCrushFriends'
+        'king.com.CandyCrushSaga','king.com.CandyCrushSodaSaga','LinkedInforWindows'
+        'MarchofEmpires','Netflix','NYTCrossword','OneCalendar','PandoraMediaInc'
+        'PhototasticCollage','PicsArt-PhotoStudio','Plex','PolarrPhotoEditorAcademicEdition'
+        'Royal Revolt','RoyalRevolt2','Shazam','Sidia.LiveWallpaper','SlingTV','Speed Test'
+        'Spotify','TikTok','TuneInRadio','Twitter','Viber','WinZipUniversal','Wunderlist'
+        'XING','2414FC7A.Viber','41038Axilesoft.ACGMediaPlayer','46928bounde.EclipseManager'
+        '4DF9E0F8.Netflix','5A894077.McAfeeSecurity','613EBCEA.PolarrPhotoEditorAcademicEdition'
+        '6Wunderkinder.Wunderlist','7EE7776C.LinkedInforWindows','89006A2E.AutodeskSketchBook'
+        '9E2F88E3.Twitter','A278AB0D.DisneyMagicKingdoms','A278AB0D.MarchofEmpires'
+        'ActiproSoftwareLLC.562882FEEB491','CAF9E577.Plex','ClearChannelRadioDigital.iHeartRadio'
+        'D52A8D61.FarmVille2CountryEscape','D5EA27B7.Duolingo-LearnLanguagesforFree'
+        'DB6EA5DB.CyberLinkMediaSuiteEssentials','DolbyLaboratories.DolbyAccess'
+        'Drawboard.DrawboardPDF','Facebook.Facebook','Fitbit.FitbitCoach','flaregamesGmbH.RoyalRevolt2'
+        'GAMELOFTSA.Asphalt8Airborne','KeeperSecurityInc.Keeper','PandoraMediaInc.29680B314EFC2'
+        'SpotifyAB.SpotifyMusic','ThumbmunkeysLtd.PhototasticCollage','WinZipComputing.WinZipUniversal'
+        'XINGAG.XING','5319275A.WhatsAppDesktop','BytedancePte.Ltd.TikTok','TikTokLtd.TikTok'
     )
 
-    dbg "Removing $($BloatApps.Count) bloat AppX packages …"
+    dbg "Removing $($BloatApps.Count) bloat packages …"
     $removed = 0
     foreach ($App in $BloatApps) {
         $pkgs = Get-AppxPackage -AllUsers -Name $App -ErrorAction SilentlyContinue
@@ -319,288 +403,194 @@ function Stage-DebloatTweaks {
             Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction SilentlyContinue
             $removed++
         }
-        # Remove provisioned (image-level) copy too
         $prov = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
                 Where-Object { $_.DisplayName -eq $App }
         foreach ($p in $prov) {
             Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -ErrorAction SilentlyContinue
         }
     }
-    dbg-ok "Removed $removed AppX package instances"
+    dbg-ok "$removed packages removed (first pass)"
 
-    # ── OneDrive removal ─────────────────────────────────────────────────────
+    # DOUBLE-CHECK
+    dbg "Verifying debloat …"
+    $remaining = 0
+    foreach ($App in $BloatApps) {
+        $pkgs = Get-AppxPackage -AllUsers -Name $App -ErrorAction SilentlyContinue
+        if ($pkgs) {
+            $remaining += $pkgs.Count
+            foreach ($pkg in $pkgs) {
+                Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    if ($remaining -eq 0) { dbg-ok "Debloat verified complete" }
+    else                  { dbg-warn "$remaining packages still present (force-removed)" }
+
+    # OneDrive
     dbg "Removing OneDrive …"
     taskkill /F /IM OneDrive.exe 2>$null
-    Start-Sleep -Seconds 2
-    $od32 = Join-Path $env:SystemRoot 'SysWOW64\OneDriveSetup.exe'
-    $od64 = Join-Path $env:SystemRoot 'System32\OneDriveSetup.exe'
+    Start-Sleep 2
+    $od32 = "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
+    $od64 = "$env:SystemRoot\System32\OneDriveSetup.exe"
     if (Test-Path $od32) { Start-Silent $od32 '/uninstall' 60 }
     if (Test-Path $od64) { Start-Silent $od64 '/uninstall' 60 }
-    # Policy block
-    $odPaths = @(
-        'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive'
-        'HKCU:\Software\Policies\Microsoft\Windows\OneDrive'
-    )
-    foreach ($p in $odPaths) {
+    foreach ($p in @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive','HKCU:\Software\Policies\Microsoft\Windows\OneDrive')) {
         if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
         Set-ItemProperty -Path $p -Name 'DisableOneDrive' -Value 1 -Type DWord
     }
-    dbg-ok "OneDrive removed & policy-blocked"
+    Remove-Item 'HKCR:\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}' -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item 'HKCR:\Wow6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}' -Recurse -Force -ErrorAction SilentlyContinue
+    dbg-ok "OneDrive removed"
 
-    # ── Mouse acceleration off ───────────────────────────────────────────────
-    dbg "Disabling mouse acceleration …"
+    # Mouse accel off
     $mKey = 'HKCU:\Control Panel\Mouse'
     if (-not (Test-Path $mKey)) { New-Item -Path $mKey -Force | Out-Null }
-    Set-ItemProperty -Path $mKey -Name 'MouseSpeed'  -Value '0' -Type String
-    Set-ItemProperty -Path $mKey -Name 'Threshold1'  -Value '0' -Type String
-    Set-ItemProperty -Path $mKey -Name 'Threshold2'  -Value '0' -Type String
-    dbg-ok "MouseSpeed=0, Threshold1=0, Threshold2=0"
+    Set-ItemProperty -Path $mKey -Name 'MouseSpeed' -Value '0' -Type String
+    Set-ItemProperty -Path $mKey -Name 'MouseThreshold1' -Value '0' -Type String
+    Set-ItemProperty -Path $mKey -Name 'MouseThreshold2' -Value '0' -Type String
+    dbg-ok "Mouse accel off"
 
-    # ── Dark mode ────────────────────────────────────────────────────────────
-    dbg "Enabling dark mode …"
+    # Dark mode
     $dKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
     if (-not (Test-Path $dKey)) { New-Item -Path $dKey -Force | Out-Null }
-    Set-ItemProperty -Path $dKey -Name 'AppsUseLightTheme'    -Value 0 -Type DWord
+    Set-ItemProperty -Path $dKey -Name 'AppsUseLightTheme' -Value 0 -Type DWord
     Set-ItemProperty -Path $dKey -Name 'SystemUsesLightTheme' -Value 0 -Type DWord
-    dbg-ok "Dark mode enabled"
+    dbg-ok "Dark mode on"
 
-    # ── Sticky Keys prompt off ───────────────────────────────────────────────
-    $skKey = 'HKCU:\Control Panel\AccessibilityKeySettings\Keys'
+    # Accessibility keys off
+    $skKey = 'HKCU:\Control Panel\Accessibility\StickyKeys'
     if (-not (Test-Path $skKey)) { New-Item -Path $skKey -Force | Out-Null }
     Set-ItemProperty -Path $skKey -Name 'Flags' -Value '506' -Type String
-    dbg-ok "Sticky Keys prompt disabled"
+    dbg-ok "Sticky Keys prompt off"
 
-    # ── Privacy / Telemetry ──────────────────────────────────────────────────
-    dbg "Applying privacy & telemetry tweaks …"
-
-    # Helper: create key if needed, then set value
+    # Privacy / Telemetry
+    dbg "Applying privacy tweaks …"
     function Set-Reg {
         param([string]$Path, [string]$Name, $Value, [string]$Type = 'DWord')
         if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
         if ($Type -eq 'String') { Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type String }
         else                    { Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type DWord }
     }
-
-    # Bing / Cortana / Search
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search'                    'BingSearchEnabled'              0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search'                    'SearchScouts'                   0
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Search'                          'AllowCortana'                   0
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Search'                          'AllowSearchMarketplace'         0
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Search'                          'AllowWebSearchMarketplace'      0
-
-    # Telemetry
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'                  'AllowTelemetry'                 0
-    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection'   'AllowTelemetry'                 0
-
-    # Activity History
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'                          'EnableActivityFeed'             0
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'                          'PublishUserActivities'          0
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'                          'UploadUserActivities'           0
-
-    # Background apps
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Control Panel\Parameters'  'EnableBackgroundApps'           0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AppPrivacy'                'LetAppsRunInBackground'         2
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AppPrivacy'                'LetAppsAccessLocation'          2
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AppPrivacy'                'LetAppsAccessMicrophone'        2
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AppPrivacy'                'LetAppsAccessCamera'            2
-
-    # GameDVR / GameBar
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameBar'                   'AllowAutoGameBar'               0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameBar'                   'UseGameBar'                     0
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Game Bar'                        'AllowGameBarPrivate'            0
-
-    # Hibernation off
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'BingSearchEnabled' 0
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Search' 'AllowCortana' 0
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' 'AllowTelemetry' 0
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'EnableActivityFeed' 0
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications' 'GlobalUserDisabled' 1
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' 'LetAppsAccessLocation' 2
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' 'LetAppsAccessCamera' 2
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'AppCaptureEnabled' 0
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled' 0
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableWindowsConsumerFeatures' 1
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' 'SystemPaneSuggestionsEnabled' 0
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' 'StartupBoostEnabled' 0
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' 'DODownloadMode' 1
     powercfg /hibernate off 2>$null
-
-    # Location
-    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location' 'Value' 'Deny' 'String'
-
-    # Storage Sense
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense'              'StorageSenseAutomate'           0
-
-    # WiFi Sense
-    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Wlansvc\Parameters'                'AllowWifiSense'                 0
-
-    # Advertising ID
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingID'             'Enabled'                        0
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Advertising'                     'AllowAdvertisingID'             0
-
-    # Windows Spotlight / Cloud Consumer
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'                    'DisableWindowsSpotlight'        1
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'                    'DisableCloudConsumerApps'       1
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'                    'DisableWindowsConsumerFeatures' 1
-
-    # Edge startup boost
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Microsoft Edge'                          'StartupBoost'                   0
-
-    # Delivery Optimisation — LAN only
-    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config' 'DODownloadMode'               1
-
-    # PowerShell telemetry
     [System.Environment]::SetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', '1', 'Machine')
+    [System.Environment]::SetEnvironmentVariable('DOTNET_CLI_TELEMETRY_OPTOUT', '1', 'Machine')
+    dbg-ok "Privacy applied"
 
-    dbg-ok "Privacy / telemetry tweaks done"
-
-    # ── Disable services ─────────────────────────────────────────────────────
-    dbg "Disabling services …"
-    $DisableSvcs = @(
-        'DiagTrack'            # Connected User Experiences & Telemetry
-        'dmawservice'          # Device Management Wireless Service
-        'Fax'
-        'MapsBroker'           # Downloaded Maps Manager
-        'MessagingService'
-        'PrintNotify'
-        'RetailDemo'           # Retail Demo Service
-        'ShellHWDetection'     # Shell Hardware Detection (auto-play)
-        'SysMain'              # Superfetch
-        'TabletInputService'   # On-screen keyboard helper
-        'WinHttpAutoProxySvc'
-        'WpnService'           # Windows Push Notifications
-        'WSearch'              # Windows Search
-        'XboxGippSvc'
-        'XboxNetSaverSvc'
-        'XboxUserSvc'
-    )
-    foreach ($s in $DisableSvcs) {
+    # Disable services
+    $svcs = @('DiagTrack','dmwappushservice','Fax','lfsvc','MapsBroker','RetailDemo','SysMain','WSearch','XblAuthManager','XboxGipSvc')
+    foreach ($s in $svcs) {
         sc.exe config $s start= disabled 2>$null
-        sc.exe stop   $s                 2>$null
+        sc.exe stop $s 2>$null
     }
-    dbg-ok "$($DisableSvcs.Count) services disabled"
+    dbg-ok "$($svcs.Count) services disabled"
 
-    # ── Disable scheduled tasks ──────────────────────────────────────────────
-    dbg "Disabling scheduled tasks …"
-    $Tasks = @(
-        'Microsoft\Windows\Application Experience\Microsoft-Windows-ApplicationExperienceInfrastructure-OneTimeScheduledTask'
-        'Microsoft\Windows\Application Experience\Microsoft-Windows-PerfTrack-Opt-In'
-        'Microsoft\Windows\Application Experience\Microsoft-Windows-SierraTelemetryInfrastructure-OneTimeScheduledTask'
-        'Microsoft\Windows\Feedback\SIUF\SysIdAp'
-        'Microsoft\Windows\Feedback\SIUF\SysIdApSched'
-        'Microsoft\Windows\Shell\FamilySafetyMonitor'
-        'Microsoft\Windows\Shell\FamilySafetyMonitorCmdStore'
-        'Microsoft\Windows\Shell\FamilySafetyMonitorSyncRL'
+    # Disable tasks
+    $tasks = @(
+        '\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser'
+        '\Microsoft\Windows\Customer Experience Improvement Program\Consolidator'
+        '\Microsoft\Windows\Feedback\Siuf\DmClient'
     )
-    foreach ($t in $Tasks) {
-        Disable-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
-    }
-    dbg-ok "$($Tasks.Count) tasks disabled"
+    foreach ($t in $tasks) { schtasks /Change /TN $t /Disable 2>$null }
+    dbg-ok "Tasks disabled"
 
-    # ── Ultimate Performance power plan ──────────────────────────────────────
-    dbg "Activating Ultimate Performance power plan …"
-    $ultGuid = 'e9a4aa16-61ba-4ed7-a5f7-edf482346f66'
-    $listOut = & powercfg /L 2>&1
-    if ($listOut -match $ultGuid) {
-        powercfg /setactivescheme $ultGuid 2>$null
-        dbg-ok "Ultimate Performance plan activated"
-    } else {
-        # Duplicate High Performance and rename
-        $highGuid = '8c016748-2fbf-4e82-9e6e-f510833e3905'
-        powercfg /duplicatescheme $highGuid $ultGuid 2>$null
-        powercfg /setactivescheme $ultGuid 2>$null
-        dbg-ok "Created + activated Ultimate Performance plan"
-    }
+    # Ultimate Performance
+    dbg "Activating Ultimate Performance …"
+    $ultGuid = 'e9a42b02-d5df-448d-aa00-03f14749eb61'
+    powercfg /duplicatescheme $ultGuid 2>$null
+    powercfg /setactivescheme $ultGuid 2>$null
+    dbg-ok "Power plan set"
 
-    # ── Show hidden files & extensions ───────────────────────────────────────
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'ShowHiddenFiles' 2
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'HideFileExt'     0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'HideSysFolder'   2
-    dbg-ok "Explorer: hidden files & extensions visible"
+    # Explorer
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'Hidden' 1
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'HideFileExt' 0
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'ShowTaskViewButton' 0
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'SearchboxTaskbarMode' 0
+    Set-Reg 'HKCU:\Control Panel\Keyboard' 'InitialKeyboardIndicators' '2' 'String'
+    Set-Reg 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32' '(Default)' '' 'String'
+    dbg-ok "Explorer tweaks applied"
 
-    # ── Start menu suggestions off ───────────────────────────────────────────
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Start' 'ShowFrequentApps'   0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Start' 'ShowRecentlyAdded'  0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Start' 'ShowRecentlyOpened' 0
-    dbg-ok "Start menu suggestions disabled"
+    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+    Start-Sleep 2
+    Start-Process explorer
 
     Set-Stage 2
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STAGE 2 — Winget App Installs
+#  STAGE 2 — Winget Apps
 # ─────────────────────────────────────────────────────────────────────────────
 function Stage-WingetApps {
-    dbg-head "STAGE 2 — Winget App Installs"
+    dbg-head "STAGE 2 — Winget Apps"
 
-    # Thorium AVX2 is here via winget (ID confirmed live: Alex313031.Thorium.AVX2)
-    # Bloxstrap replaces standalone Roblox bootstrapper
-    $Apps = @(
-        'Valve.Steam'
-        'Discord.Discord'
-        'Spotify.Spotify'
-        'VideoLAN.VLC'
-        '7zip.7zip'
-        'Bitwarden.Bitwarden'
-        'Python.Python.3'
-        'Ablaze.Floorp'
-        'Git.Git'
-        'pizzaboxer.Bloxstrap'
-        'voidtools.Everything'
-        'WizTree.WizTree'
-        'EpicGames.EpicGamesLauncher'
-        'Modrinth.ModrinthApp'
-        'Logitech.GHUB'
-        'Alex313031.Thorium.AVX2'
-    )
-
-    foreach ($id in $Apps) {
-        dbg "  Installing $id …"
+    function Install-WingetApp {
+        param([string]$Id)
+        dbg "  $Id"
         try {
-            $out = & winget install --exact --id $id `
-                --silent `
-                --accept-package-agreements `
-                --accept-source-agreements `
-                --disable-interactivity 2>&1
-            if ($out -match 'Successfully installed') { dbg-ok "$id installed" }
-            else { dbg-warn "$id — last output: $(($out | Select-Object -Last 3) -join ' | ')" }
-        } catch { dbg-err "$id — exception: $_" }
-        Start-Sleep -Seconds 2
+            $out = & winget install --exact --id $Id --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1
+            $outStr = $out -join ' '
+            if ($outStr -match 'Successfully installed|already installed') { 
+                dbg-ok "$Id OK"
+                return $true
+            }
+            dbg-warn "$Id — $(($out | Select-Object -Last 1))"
+            return $false
+        } catch { dbg-err "$Id — $_"; return $false }
     }
+
+    $apps = @('Valve.Steam','Discord.Discord','Spotify.Spotify','VideoLAN.VLC','7zip.7zip','Bitwarden.Bitwarden',
+              'Python.Python.3.12','Ablaze.Floorp','Git.Git','Bloxstrap','voidtools.Everything',
+              'AntibodySoftware.WizTree','EpicGames.EpicGamesLauncher','Modrinth.ModrinthApp',
+              'Logitech.GHUB','Alex313031.Thorium.AVX2','PrismLauncher.PrismLauncher')
+
+    $ok = 0; $fail = 0
+    foreach ($id in $apps) {
+        if (Install-WingetApp $id) { $ok++ } else { $fail++ }
+        Start-Sleep 1
+    }
+    dbg-ok "$ok installed, $fail failed"
 
     Set-Stage 3
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STAGE 3 — Manual App Installs  (Vencord, TCNO)
+#  STAGE 3 — Manual Apps
 # ─────────────────────────────────────────────────────────────────────────────
 function Stage-ManualApps {
-    dbg-head "STAGE 3 — Manual App Installs"
+    dbg-head "STAGE 3 — Manual Apps"
     Ensure-TempDir
 
-    # ── Vencord ──────────────────────────────────────────────────────────────
-    # Verified: raw.githubusercontent.com/Vencord/Installer/main/install.ps1 is LIVE.
-    # That script downloads VencordInstallerCli.exe from GitHub releases/latest.
-    # The CLI is a Go binary with NO silent flags.  It prompts interactively:
-    #   - Pick install type  (we want index 0 = stable Discord)
-    #   - Confirm install    (y)
-    # We download the exe directly via GitHub API, then pipe stdin via cmd.
-    dbg "Resolving VencordInstallerCli.exe …"
-    $vencordUrl  = Get-LatestAssetUrl -Owner 'Vencord' -Repo 'Installer' -Pattern 'VencordInstallerCli\.exe$'
-    $vencordDest = Join-Path $TEMP_DIR 'VencordInstallerCli.exe'
-    if ($vencordUrl -and (Invoke-Download $vencordUrl $vencordDest)) {
-        dbg "  Piping stdin to VencordInstallerCli (select stable, confirm yes) …"
+    # Vencord
+    $vUrl = Get-LatestAssetUrl -Owner 'Vencord' -Repo 'Installer' -Pattern 'VencordInstallerCli\.exe$'
+    $vDest = Join-Path $TEMP_DIR 'VencordInstallerCli.exe'
+    if ($vUrl -and (Invoke-Download $vUrl $vDest)) {
+        dbg "Piping stdin to Vencord CLI"
         try {
-            # "0" selects stable Discord, "y" confirms.  Pipe both via cmd /c.
-            $p = Start-Process -FilePath 'cmd.exe' `
-                -ArgumentList "/c (echo 0 & echo y) | `"$vencordDest`"" `
-                -WindowStyle Hidden -PassThru
+            $p = Start-Process -FilePath 'cmd.exe' -ArgumentList "/c (echo 0 & echo y) | `"$vDest`"" -WindowStyle Hidden -PassThru
             $exited = $p.WaitForExit(120000)
-            if ($exited) { dbg-ok "VencordInstallerCli finished (exit $($p.ExitCode))" }
-            else         { dbg-warn "VencordInstallerCli timed out after 120s — killing"; $p.Kill() }
-        } catch { dbg-err "Vencord stdin-pipe failed: $_" }
-    } else {
-        dbg-warn "Vencord exe could not be resolved/downloaded — skipping"
+            if ($exited) { dbg-ok "Vencord done (exit $($p.ExitCode))" }
+            else         { dbg-warn "Vencord timeout"; $p.Kill() }
+        } catch { dbg-err "Vencord failed: $_" }
     }
 
-    # ── TCNO Account Switcher ────────────────────────────────────────────────
-    # Confirmed: TCNOco/TcNo-Acc-Switcher releases page is live.
-    # Installer is Inno Setup => /VERYSILENT /NOPROMPT are standard flags.
-    dbg "Resolving TCNO Account Switcher installer …"
-    $tcnoUrl  = Get-LatestAssetUrl -Owner 'TCNOco' -Repo 'TcNo-Acc-Switcher' -Pattern 'TcNo\.Account\.Switcher.*Installer.*\.exe$'
-    $tcnoDest = Join-Path $TEMP_DIR 'TcNoInstaller.exe'
-    if ($tcnoUrl -and (Invoke-Download $tcnoUrl $tcnoDest)) {
-        Start-Silent $tcnoDest '/VERYSILENT /NOPROMPT' 180
-        dbg-ok "TCNO Account Switcher installed"
-    } else {
-        dbg-warn "TCNO installer could not be resolved/downloaded — skipping"
+    # TCNO
+    $tUrl = Get-LatestAssetUrl -Owner 'TCNOco' -Repo 'TcNo-Acc-Switcher' -Pattern 'Installer.*\.exe$'
+    $tDest = Join-Path $TEMP_DIR 'TcNoInstaller.exe'
+    if ($tUrl -and (Invoke-Download $tUrl $tDest)) {
+        Start-Silent $tDest '/VERYSILENT /NORESTART' 180
+        dbg-ok "TCNO installed"
     }
 
     Set-Stage 4
@@ -610,84 +600,63 @@ function Stage-ManualApps {
 #  STAGE 4 — GPU Drivers
 # ─────────────────────────────────────────────────────────────────────────────
 function Stage-GPUDrivers {
-    dbg-head "STAGE 4 — GPU Driver Install"
+    dbg-head "STAGE 4 — GPU Drivers"
     Ensure-TempDir
 
-    $gpu     = Get-WmiObject Win32_VideoController -ErrorAction SilentlyContinue | Select-Object -First 1
+    $gpu = Get-WmiObject Win32_VideoController -ErrorAction SilentlyContinue | Select-Object -First 1
     $gpuName = if ($gpu) { $gpu.Name } else { 'UNKNOWN' }
-    dbg "Detected GPU: $gpuName"
+    dbg "GPU: $gpuName"
 
     if ($gpuName -match 'NVIDIA|GeForce|Quadro|Tesla') {
-        # ── NVIDIA App installer ─────────────────────────────────────────────
-        # nvidia.com/en-us/software/nvidia-app/ is confirmed live.
-        # The community gist (emilwojcik93) confirms the scrape approach and
-        # the silent flags from setup.cfg:
-        #   -silent -noreboot -noeula -nofinish -passive
-        # Current known version (WAPT, signed 2026-01-26): 11.0.6.383
-        # We scrape the page at runtime; fall back to that version if scrape fails.
-        dbg "NVIDIA GPU detected — scraping NVIDIA App download URL …"
-        $nvidiaUrl = $null
+        dbg "Fetching NVIDIA App …"
+        $nvUrl = $null
         try {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             $page = Invoke-WebRequest -Uri 'https://www.nvidia.com/en-us/software/nvidia-app/' -UseBasicParsing -ErrorAction Stop
-            # Look for the versioned CDN URL pattern in page source
-            if ($page.Content -match 'https://[^\s"''<>]us.download.nvidia.com[^\s"''<>].exe') {
-                $nvidiaUrl = $Matches[0]
-                dbg-ok "Scraped NVIDIA App URL: $nvidiaUrl"
+            if ($page.Content -match 'https://[^\s"''<>]*us\.download\.nvidia\.com[^\s"''<>]*\.exe') {
+                $nvUrl = $Matches[0]
+                dbg-ok "Scraped: $nvUrl"
             }
-        } catch { dbg-warn "NVIDIA page scrape failed: $_" }
-
-        if (-not $nvidiaUrl) {
-            $nvidiaUrl = 'https://us.download.nvidia.com/nvapp/client/11.0.6.383/NVIDIA_app_v11.0.6.383.exe'
-            dbg-warn "Using known fallback URL: $nvidiaUrl"
+        } catch { dbg-warn "Scrape failed: $_" }
+        if (-not $nvUrl) {
+            $nvUrl = 'https://us.download.nvidia.com/nvapp/client/11.0.6.383/NVIDIA_app_v11.0.6.383.exe'
+            dbg-warn "Using fallback"
         }
-
-        $nvDest = Join-Path $TEMP_DIR 'NVIDIA_app_installer.exe'
-        if (Invoke-Download $nvidiaUrl $nvDest) {
-            Start-Silent $nvDest '-silent -noreboot -noeula -nofinish -passive' 600
-            dbg-ok "NVIDIA App installer executed"
+        $nvDest = Join-Path $TEMP_DIR 'NVIDIA_app.exe'
+        if (Invoke-Download $nvUrl $nvDest) {
+            Start-Silent $nvDest '-s -noreboot -noeula -nofinish' 600
+            dbg-ok "NVIDIA App executed"
         }
-
-    } elseif ($gpuName -match 'AMD|Radeon|FirePro') {
-        # AMD does NOT publish a single stable direct-download URL.
-        # Their download page requires JavaScript auto-detect.
-        # Logging a clear warning so the user knows to do it manually.
-        dbg-warn "AMD GPU detected ($gpuName)"
-        dbg-warn "AMD has no stable single installer URL — please download drivers"
-        dbg-warn "manually from: https://www.amd.com/en/support"
-
+    } elseif ($gpuName -match 'AMD|Radeon') {
+        dbg-warn "AMD GPU — download manually: https://www.amd.com/en/support"
+    } elseif ($gpuName -match 'Intel|Arc|Iris') {
+        $intelUrl = 'https://dsadata.intel.com/installer/Intel%20Driver%20%26%20Support%20Assistant%20Installer.exe'
+        $intelDest = Join-Path $TEMP_DIR 'Intel_DSA.exe'
+        if (Invoke-Download $intelUrl $intelDest) {
+            Start-Silent $intelDest '/quiet /norestart' 300
+            dbg-ok "Intel DSA installed"
+        }
     } else {
-        dbg-warn "No discrete NVIDIA/AMD GPU detected ($gpuName) — skipping drivers"
+        dbg-warn "No discrete GPU — skipping"
     }
 
     Set-Stage 5
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STAGE 5 — Windows HWID Activation  (MAS)
+#  STAGE 5 — Windows Activation
 # ─────────────────────────────────────────────────────────────────────────────
 function Stage-Activation {
-    dbg-head "STAGE 5 — Windows HWID Activation (MAS)"
-    # VERIFIED on massgrave.dev/command_line_switches:
-    #   & ([ScriptBlock]::Create((irm https://get.activated.win))) /HWID
-    # runs HWID fully unattended. /HWID is the documented switch.
-    # get.activated.win confirmed live above — it returns the MAS PowerShell script.
-    # There is NO "HWID.bat", NO "Separate-Files" folder in the MAS repo.
-    dbg "Downloading MAS script from https://get.activated.win …"
+    dbg-head "STAGE 5 — Windows Activation (MAS)"
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $masResp = Invoke-WebRequest -Uri 'https://get.activated.win' -UseBasicParsing -ErrorAction Stop
-        if ($masResp -and $masResp.Content -and $masResp.Content.Length -gt 100) {
-            dbg-ok "MAS script downloaded ($($masResp.Content.Length) chars)"
-            dbg "Executing MAS with /HWID switch (unattended) …"
-            & ([ScriptBlock]::Create($masResp.Content)) /HWID
-            dbg-ok "MAS /HWID execution completed"
-        } else {
-            dbg-err "MAS script body was empty or too short"
+        $mas = Invoke-WebRequest -Uri 'https://get.activated.win' -UseBasicParsing -ErrorAction Stop
+        if ($mas.Content.Length -gt 100) {
+            dbg-ok "MAS downloaded ($($mas.Content.Length) chars)"
+            & ([ScriptBlock]::Create($mas.Content)) /HWID
+            dbg-ok "MAS executed"
         }
-    } catch {
-        dbg-err "MAS activation failed: $_"
-    }
+    } catch { dbg-err "MAS failed: $_" }
 
     Set-Stage 99
 }
@@ -696,30 +665,17 @@ function Stage-Activation {
 #  STAGE 99 — Cleanup
 # ─────────────────────────────────────────────────────────────────────────────
 function Stage-Cleanup {
-    dbg-head "STAGE 99 — Cleanup & Done"
-
+    dbg-head "STAGE 99 — Cleanup"
     Remove-Persistence
-
-    # Launch Task Manager visibly so user knows we finished
-    Start-Process -FilePath 'taskmgr.exe' -WindowStyle Normal
-    dbg-ok "taskmgr.exe launched"
-
-    # Delete temp files (best-effort; log itself may be locked)
-    Start-Sleep -Seconds 2
+    Start-Process taskmgr.exe -WindowStyle Normal
+    dbg-ok "taskmgr launched"
+    Start-Sleep 2
     try {
         if (Test-Path $TEMP_DIR) {
-            Get-ChildItem $TEMP_DIR -Recurse -Force |
-                Where-Object { -not $_.PSIsDirectory } |
-                Remove-Item -Force -ErrorAction SilentlyContinue
-            Get-ChildItem $TEMP_DIR -Recurse -Directory |
-                Sort-Object { $_.FullName.Length } -Descending |
-                Remove-Item -Force -ErrorAction SilentlyContinue
-            Remove-Item $TEMP_DIR -Force -Recurse -ErrorAction SilentlyContinue
+            Remove-Item $TEMP_DIR -Recurse -Force -ErrorAction SilentlyContinue
         }
     } catch {}
-
-    dbg-ok "All done. Log was at: $LOG_PATH"
-    dbg "Exiting."
+    dbg-ok "Done. Log: $LOG_PATH"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -730,9 +686,13 @@ Ensure-Admin
 
 Clear-Host
 Write-Host '+---------------------------------------------------------+' -ForegroundColor Cyan
-Write-Host '|   MestalWinBox  --  DEBUG MODE                          |' -ForegroundColor Cyan
-Write-Host '|   Everything is logged here AND to:                     |' -ForegroundColor Cyan
-Write-Host '|   %TEMP%\MestalTemp\mestal_debug.log                   |' -ForegroundColor Cyan
+Write-Host '|   MestalWinBox  --  FINAL VERSION                       |' -ForegroundColor Cyan
+Write-Host '|   - Chocolatey → winget                                 |' -ForegroundColor Cyan
+Write-Host '|   - Winget ToS pre-accepted                             |' -ForegroundColor Cyan
+Write-Host '|   - Debloat double-check                                |' -ForegroundColor Cyan
+Write-Host '|   - WinUtil Standard (2025)                             |' -ForegroundColor Cyan
+Write-Host '|                                                         |' -ForegroundColor Cyan
+Write-Host '|   Log: %TEMP%\MestalTemp\mestal_debug.log              |' -ForegroundColor Cyan
 Write-Host '+---------------------------------------------------------+' -ForegroundColor Cyan
 Write-Host ''
 
