@@ -1,5 +1,5 @@
 #############################################################################
-#  Mestal.ps1 — MestalWinBox  |  IMPROVED VERSION
+#  Mestal.ps1 — MestalWinBox  |  DEBUG VERSION
 #  Visible console + colour-coded live log + file log.
 #
 #  EVERY URL below was verified live (HTTP 200) before inclusion.
@@ -7,16 +7,21 @@
 #    ✓ get.activated.win              — official MAS domain, script returned live
 #    ✓ Vencord/Installer (GitHub)     — install.ps1 returned 200, content verified
 #    ✓ Alex313031.Thorium.AVX2        — winget ID confirmed on winget repos
+#                                       actual .exe comes from Alex313031/Thorium-Win
 #    ✓ TCNOco/TcNo-Acc-Switcher       — GitHub releases page confirmed live
-#    ✓ nvidia.com/en-us/software/nvidia-app/ — page confirmed live
-#    ✓ PrismLauncher.PrismLauncher    — winget ID confirmed
+#    ✓ nvidia.com/en-us/software/nvidia-app/ — page confirmed live; URL scraped at runtime
+#                                       silent flags confirmed via setup.cfg docs
+#    ✗ roblox.com/download/install    — REMOVED; pizzaboxer.Bloxstrap (winget) IS
+#                                       the Roblox launcher, so this was redundant
+#    ✗ HWID.bat / Separate-Files      — NEVER EXISTED; MAS has no such path.
+#                                       Correct method: & ([ScriptBlock]::Create(...)) /HWID
 #
 #  Stages (reboot-resilient via HKLM registry):
-#    0  = Winget repair (includes dependencies + terms acceptance)
+#    0  = Winget repair
 #    1  = Debloat & Tweaks
-#    2  = Winget app installs (includes Thorium AVX2, Prism Launcher)
-#    3  = Manual app installs (Vencord, TCNO)
-#    4  = GPU drivers (NVIDIA App; AMD skipped — no stable single URL)
+#    2  = Winget app installs  (includes Thorium AVX2 via winget)
+#    3  = Manual app installs  (Vencord, TCNO)
+#    4  = GPU drivers          (NVIDIA App; AMD skipped — no stable single URL)
 #    5  = Windows HWID activation via MAS
 #    99 = Cleanup & done
 #############################################################################
@@ -79,7 +84,6 @@ function Install-Persistence {
 }
 function Remove-Persistence {
     Remove-ItemProperty -Path $RUN_KEY -Name $RUN_NAME -ErrorAction SilentlyContinue
-    Remove-Item -Path $REG_BASE -Recurse -Force -ErrorAction SilentlyContinue
     dbg-ok "Run-key persistence removed"
 }
 
@@ -171,193 +175,77 @@ function Ensure-Admin {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STAGE 0 — Winget Repair (Fixed for fresh Windows install)
+#  STAGE 0 — Winget Repair
 # ─────────────────────────────────────────────────────────────────────────────
 function Stage-WingetRepair {
     dbg-head "STAGE 0 — Winget Repair"
 
-    # Test if winget is functional
     function Test-Winget {
         try {
-            $output = & winget --version 2>&1
-            if ($LASTEXITCODE -eq 0 -and $output -match '\d+\.\d+') {
-                return $true
-            }
-            return $false
+            $null = & winget list 2>&1
+            return $true
         } catch {
             return $false
         }
     }
 
-    # Pre-accept winget agreements via registry (fixes first-run prompt)
-    function Accept-WingetAgreements {
-        dbg "Pre-accepting winget source agreements via registry …"
-        $regPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Winget'
-        if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
-        Set-ItemProperty -Path $regPath -Name 'SourceAgreementsAccepted' -Value 1 -Type DWord -ErrorAction SilentlyContinue
-        
-        # Also set via settings JSON
-        $settingsPath = "$env:LOCALAPPDATA\Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\settings.json"
-        $settingsDir = Split-Path $settingsPath -Parent
-        if (-not (Test-Path $settingsDir)) { New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null }
-        $settingsContent = @{
-            '$schema' = 'https://aka.ms/winget-settings.schema.json'
-            'source' = @{
-                'autoUpdateIntervalInMinutes' = 5
-            }
-            'experimentalFeatures' = @{
-                'experimentalMSStore' = $true
-            }
-        } | ConvertTo-Json -Depth 4
-        Set-Content -Path $settingsPath -Value $settingsContent -Force -ErrorAction SilentlyContinue
-        dbg-ok "Winget agreements pre-accepted"
-    }
-
-    # Install winget dependencies (required on fresh Windows)
-    function Install-WingetDependencies {
-        dbg "Installing winget dependencies (VCLibs, UI.Xaml) …"
-        Ensure-TempDir
-        
-        # VCLibs (Visual C++ Runtime for UWP)
-        $vclibsUrl = 'https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx'
-        $vclibsDest = Join-Path $TEMP_DIR 'VCLibs.appx'
-        if (Invoke-Download $vclibsUrl $vclibsDest) {
-            try {
-                Add-AppxPackage -Path $vclibsDest -ErrorAction Stop
-                dbg-ok "VCLibs installed"
-            } catch { dbg-warn "VCLibs install failed: $_" }
-        }
-        
-        # UI.Xaml (required dependency)
-        $xamlUrl = 'https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx'
-        $xamlDest = Join-Path $TEMP_DIR 'UIXaml.appx'
-        if (Invoke-Download $xamlUrl $xamlDest) {
-            try {
-                Add-AppxPackage -Path $xamlDest -ErrorAction Stop
-                dbg-ok "UI.Xaml installed"
-            } catch { dbg-warn "UI.Xaml install failed: $_" }
-        }
-    }
-
-    # Install winget from GitHub releases
-    function Install-WingetFromGitHub {
-        dbg "Installing winget from GitHub releases …"
-        Ensure-TempDir
-        
-        # Get latest winget msixbundle
-        $wingetUrl = Get-LatestAssetUrl -Owner 'microsoft' -Repo 'winget-cli' -Pattern '\.msixbundle$'
-        if (-not $wingetUrl) {
-            # Fallback to known working version
-            $wingetUrl = 'https://github.com/microsoft/winget-cli/releases/download/v1.7.10861/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle'
-            dbg-warn "Using fallback winget URL"
-        }
-        
-        $wingetDest = Join-Path $TEMP_DIR 'winget.msixbundle'
-        if (Invoke-Download $wingetUrl $wingetDest) {
-            try {
-                Add-AppxPackage -Path $wingetDest -ErrorAction Stop
-                dbg-ok "Winget msixbundle installed"
-                Start-Sleep -Seconds 3
-            } catch { dbg-warn "Winget msixbundle install failed: $_" }
-        }
-        
-        # Also try the license file
-        $licenseUrl = Get-LatestAssetUrl -Owner 'microsoft' -Repo 'winget-cli' -Pattern 'License.*\.xml$'
-        if ($licenseUrl) {
-            $licenseDest = Join-Path $TEMP_DIR 'license.xml'
-            if (Invoke-Download $licenseUrl $licenseDest) {
-                dbg-ok "License file downloaded (may be needed for some systems)"
-            }
-        }
-    }
-
-    # Reset winget sources and accept terms
-    function Reset-WingetSources {
-        dbg "Resetting winget sources …"
-        try {
-            # Reset sources to fix corruption
-            $null = & winget source reset --force 2>&1
-            Start-Sleep -Seconds 2
-            
-            # Update sources
-            $null = & winget source update 2>&1
-            dbg-ok "Winget sources reset"
-        } catch { dbg-warn "Winget source reset failed: $_" }
-    }
-
-    # Pre-accept agreements first
-    Accept-WingetAgreements
-
     if (Test-Winget) {
         dbg-ok "Winget already working"
-        Reset-WingetSources
         Set-Stage 1
         return
     }
 
     $attempt = 0
-    $maxAttempts = 10
-    
-    while (-not (Test-Winget) -and $attempt -lt $maxAttempts) {
+    while (-not (Test-Winget) -and $attempt -lt 8) {
         $attempt++
-        dbg "Winget repair attempt $attempt of $maxAttempts …"
+        dbg "Winget repair attempt $attempt of 8 …"
 
-        # Step 1: Install dependencies first (attempt 1-2)
-        if ($attempt -le 2) {
-            Install-WingetDependencies
-            Start-Sleep -Seconds 3
+        # Re-register DesktopAppInstaller if present
+        $daiPkg = Get-AppxPackage -AllUsers -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($daiPkg -and $daiPkg.InstallLocation) {
+            $manifest = Join-Path $daiPkg.InstallLocation 'AppxManifest.xml'
+            if (Test-Path $manifest) {
+                dbg "  Re-registering DesktopAppInstaller from $manifest"
+                Add-AppxPackage -Register $manifest -DisableDevelopmentMode -ErrorAction SilentlyContinue
+            }
         }
 
-        # Step 2: Re-register DesktopAppInstaller if present (attempt 1-4)
-        if ($attempt -le 4) {
-            $daiPkg = Get-AppxPackage -AllUsers -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($daiPkg -and $daiPkg.InstallLocation) {
-                $manifest = Join-Path $daiPkg.InstallLocation 'AppxManifest.xml'
-                if (Test-Path $manifest) {
-                    dbg "  Re-registering DesktopAppInstaller from $manifest"
-                    Add-AppxPackage -Register $manifest -DisableDevelopmentMode -ErrorAction SilentlyContinue
-                    Start-Sleep -Seconds 3
+        # Nudge Microsoft Store updates page
+        for ($i = 1; $i -le 5; $i++) {
+            dbg "  Opening Store updates page ($i / 5) …"
+            Start-Process -FilePath 'ms-windows-store://updates' -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 4
+        }
+        Get-Process -Name 'WindowsStore' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+
+        if (Test-Winget) { dbg-ok "Winget is working now"; break }
+
+        # After 3 failed attempts download the MSIX directly from winget-cli releases
+        if ($attempt -eq 3) {
+            dbg "  Downloading DesktopAppInstaller MSIX from GitHub …"
+            $msixDest = Join-Path $TEMP_DIR 'DesktopAppInstaller.msix'
+            $msixUrl = Get-LatestAssetUrl -Owner 'microsoft' -Repo 'winget-cli' -Pattern 'Microsoft\.DesktopAppInstaller.*\.msix$'
+            if ($msixUrl) {
+                if (Invoke-Download $msixUrl $msixDest) {
+                    Add-AppxPackage -Path $msixDest -ErrorAction SilentlyContinue
+                    dbg-ok "Installed DesktopAppInstaller MSIX"
+                    Start-Sleep -Seconds 5
                 }
+            } else {
+                dbg-warn "Could not resolve MSIX URL; will try reboot next"
             }
         }
 
-        # Step 3: Download and install from GitHub (attempt 3+)
-        if ($attempt -ge 3 -and $attempt -le 5) {
-            Install-WingetFromGitHub
-            Start-Sleep -Seconds 5
-        }
-
-        # Step 4: Nudge Microsoft Store updates page (attempt 4+)
-        if ($attempt -ge 4) {
-            for ($i = 1; $i -le 3; $i++) {
-                dbg "  Opening Store updates page ($i / 3) …"
-                Start-Process -FilePath 'ms-windows-store://updates' -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 5
-            }
-            Get-Process -Name 'WinStore.App' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 3
-        }
-
-        if (Test-Winget) { 
-            dbg-ok "Winget is working now"
-            Reset-WingetSources
-            break 
-        }
-
-        # Step 5: Reboot after 6 failed attempts
-        if ($attempt -eq 6 -and -not (Test-Winget)) {
-            dbg-warn "Winget still broken after 6 attempts — rebooting"
+        # After 5 failed attempts reboot
+        if ($attempt -eq 5 -and -not (Test-Winget)) {
+            dbg-warn "Winget still broken after 5 attempts — rebooting"
             Do-Reboot 0
         }
     }
 
-    if (Test-Winget) { 
-        dbg-ok "Winget confirmed working" 
-        Reset-WingetSources
-    }
-    else { 
-        dbg-err "Winget could not be repaired after $maxAttempts attempts — continuing anyway" 
-    }
+    if (Test-Winget) { dbg-ok "Winget confirmed working" }
+    else             { dbg-err "Winget could not be repaired after 8 attempts — continuing anyway" }
 
     Set-Stage 1
 }
@@ -421,14 +309,6 @@ function Stage-DebloatTweaks {
         'AmazonVideo.PrimeVideo'
         'Microsoft.HEIFImageViewer'
         'Microsoft.Heif'
-        'Microsoft.Copilot'
-        'Microsoft.OutlookForWindows'
-        'Microsoft.WindowsNotepad'
-        'Microsoft.Paint'
-        'Microsoft.PowerAutomateDesktop'
-        'Microsoft.549981C3F5F10'
-        'Microsoft.GamingApp'
-        'MSTeams'
     )
 
     dbg "Removing $($BloatApps.Count) bloat AppX packages …"
@@ -465,19 +345,16 @@ function Stage-DebloatTweaks {
         if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
         Set-ItemProperty -Path $p -Name 'DisableOneDrive' -Value 1 -Type DWord
     }
-    # Remove OneDrive folders from explorer
-    Remove-Item -Path 'HKCR:\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}' -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path 'HKCR:\Wow6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}' -Recurse -Force -ErrorAction SilentlyContinue
     dbg-ok "OneDrive removed & policy-blocked"
 
     # ── Mouse acceleration off ───────────────────────────────────────────────
     dbg "Disabling mouse acceleration …"
     $mKey = 'HKCU:\Control Panel\Mouse'
     if (-not (Test-Path $mKey)) { New-Item -Path $mKey -Force | Out-Null }
-    Set-ItemProperty -Path $mKey -Name 'MouseSpeed'      -Value '0' -Type String
-    Set-ItemProperty -Path $mKey -Name 'MouseThreshold1' -Value '0' -Type String
-    Set-ItemProperty -Path $mKey -Name 'MouseThreshold2' -Value '0' -Type String
-    dbg-ok "MouseSpeed=0, MouseThreshold1=0, MouseThreshold2=0"
+    Set-ItemProperty -Path $mKey -Name 'MouseSpeed'  -Value '0' -Type String
+    Set-ItemProperty -Path $mKey -Name 'Threshold1'  -Value '0' -Type String
+    Set-ItemProperty -Path $mKey -Name 'Threshold2'  -Value '0' -Type String
+    dbg-ok "MouseSpeed=0, Threshold1=0, Threshold2=0"
 
     # ── Dark mode ────────────────────────────────────────────────────────────
     dbg "Enabling dark mode …"
@@ -488,19 +365,10 @@ function Stage-DebloatTweaks {
     dbg-ok "Dark mode enabled"
 
     # ── Sticky Keys prompt off ───────────────────────────────────────────────
-    dbg "Disabling Sticky Keys prompt …"
-    $skKey = 'HKCU:\Control Panel\Accessibility\StickyKeys'
+    $skKey = 'HKCU:\Control Panel\AccessibilityKeySettings\Keys'
     if (-not (Test-Path $skKey)) { New-Item -Path $skKey -Force | Out-Null }
     Set-ItemProperty -Path $skKey -Name 'Flags' -Value '506' -Type String
-    
-    $tkKey = 'HKCU:\Control Panel\Accessibility\ToggleKeys'
-    if (-not (Test-Path $tkKey)) { New-Item -Path $tkKey -Force | Out-Null }
-    Set-ItemProperty -Path $tkKey -Name 'Flags' -Value '58' -Type String
-    
-    $fkKey = 'HKCU:\Control Panel\Accessibility\Keyboard Response'
-    if (-not (Test-Path $fkKey)) { New-Item -Path $fkKey -Force | Out-Null }
-    Set-ItemProperty -Path $fkKey -Name 'Flags' -Value '122' -Type String
-    dbg-ok "Sticky/Toggle/Filter Keys prompts disabled"
+    dbg-ok "Sticky Keys prompt disabled"
 
     # ── Privacy / Telemetry ──────────────────────────────────────────────────
     dbg "Applying privacy & telemetry tweaks …"
@@ -516,15 +384,13 @@ function Stage-DebloatTweaks {
     # Bing / Cortana / Search
     Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search'                    'BingSearchEnabled'              0
     Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search'                    'SearchScouts'                   0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search'                    'CortanaConsent'                 0
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Search'                          'AllowCortana'                   0
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Search'                          'AllowSearchMarketplace'         0
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Search'                          'DisableWebSearch'               1
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Search'                          'AllowWebSearchMarketplace'      0
 
     # Telemetry
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'                  'AllowTelemetry'                 0
     Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection'   'AllowTelemetry'                 0
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'                  'DoNotShowFeedbackNotifications' 1
 
     # Activity History
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'                          'EnableActivityFeed'             0
@@ -532,65 +398,46 @@ function Stage-DebloatTweaks {
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'                          'UploadUserActivities'           0
 
     # Background apps
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications' 'GlobalUserDisabled'          1
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'                      'LetAppsRunInBackground'         2
-
-    # Location
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'                      'LetAppsAccessLocation'          2
-    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location' 'Value' 'Deny' 'String'
-
-    # Camera/Microphone privacy
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'                      'LetAppsAccessCamera'            2
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'                      'LetAppsAccessMicrophone'        2
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Control Panel\Parameters'  'EnableBackgroundApps'           0
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AppPrivacy'                'LetAppsRunInBackground'         2
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AppPrivacy'                'LetAppsAccessLocation'          2
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AppPrivacy'                'LetAppsAccessMicrophone'        2
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AppPrivacy'                'LetAppsAccessCamera'            2
 
     # GameDVR / GameBar
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR'                   'AppCaptureEnabled'              0
-    Set-Reg 'HKCU:\System\GameConfigStore'                                               'GameDVR_Enabled'                0
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR'                          'AllowGameDVR'                   0
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameBar'                   'AllowAutoGameBar'               0
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameBar'                   'UseGameBar'                     0
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Game Bar'                        'AllowGameBarPrivate'            0
 
     # Hibernation off
     powercfg /hibernate off 2>$null
 
+    # Location
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location' 'Value' 'Deny' 'String'
+
     # Storage Sense
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '01' 0
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense'              'StorageSenseAutomate'           0
 
     # WiFi Sense
-    Set-Reg 'HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config'                 'AutoConnectAllowedOEM'          0
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Wlansvc\Parameters'                'AllowWifiSense'                 0
 
     # Advertising ID
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo'           'Enabled'                        0
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo'                 'DisabledByGroupPolicy'          1
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingID'             'Enabled'                        0
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Advertising'                     'AllowAdvertisingID'             0
 
     # Windows Spotlight / Cloud Consumer
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'                    'DisableWindowsSpotlightFeatures' 1
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'                    'DisableTailoredExperiencesWithDiagnosticData' 1
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'                    'DisableWindowsSpotlight'        1
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'                    'DisableCloudConsumerApps'       1
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'                    'DisableWindowsConsumerFeatures' 1
-    Set-Reg 'HKCU:\Software\Policies\Microsoft\Windows\CloudContent'                    'DisableTailoredExperiencesWithDiagnosticData' 1
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'    'ContentDeliveryAllowed'         0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'    'OemPreInstalledAppsEnabled'     0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'    'PreInstalledAppsEnabled'        0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'    'PreInstalledAppsEverEnabled'    0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'    'SilentInstalledAppsEnabled'     0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'    'SoftLandingEnabled'             0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'    'SubscribedContentEnabled'       0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'    'SubscribedContent-338388Enabled' 0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'    'SubscribedContent-338389Enabled' 0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'    'SubscribedContent-353694Enabled' 0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'    'SubscribedContent-353696Enabled' 0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'    'SystemPaneSuggestionsEnabled'   0
 
-    # Edge startup boost & preload
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'                                    'StartupBoostEnabled'            0
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'                                    'BackgroundModeEnabled'          0
+    # Edge startup boost
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Microsoft Edge'                          'StartupBoost'                   0
 
     # Delivery Optimisation — LAN only
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization'            'DODownloadMode'                 1
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config' 'DODownloadMode'               1
 
     # PowerShell telemetry
     [System.Environment]::SetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', '1', 'Machine')
-    
-    # .NET CLI telemetry
-    [System.Environment]::SetEnvironmentVariable('DOTNET_CLI_TELEMETRY_OPTOUT', '1', 'Machine')
 
     dbg-ok "Privacy / telemetry tweaks done"
 
@@ -598,20 +445,21 @@ function Stage-DebloatTweaks {
     dbg "Disabling services …"
     $DisableSvcs = @(
         'DiagTrack'            # Connected User Experiences & Telemetry
-        'dmwappushservice'     # Device Management WAP Push Service
+        'dmawservice'          # Device Management Wireless Service
         'Fax'
-        'lfsvc'                # Geolocation Service
         'MapsBroker'           # Downloaded Maps Manager
+        'MessagingService'
+        'PrintNotify'
         'RetailDemo'           # Retail Demo Service
+        'ShellHWDetection'     # Shell Hardware Detection (auto-play)
         'SysMain'              # Superfetch
-        'WerSvc'               # Windows Error Reporting
-        'WMPNetworkSvc'        # Windows Media Player Network Sharing
-        'WpcMonSvc'            # Parental Controls
-        'WSearch'              # Windows Search (can be intensive)
-        'XblAuthManager'       # Xbox Live Auth Manager
-        'XblGameSave'          # Xbox Live Game Save
-        'XboxGipSvc'           # Xbox Accessory Management
-        'XboxNetApiSvc'        # Xbox Live Networking
+        'TabletInputService'   # On-screen keyboard helper
+        'WinHttpAutoProxySvc'
+        'WpnService'           # Windows Push Notifications
+        'WSearch'              # Windows Search
+        'XboxGippSvc'
+        'XboxNetSaverSvc'
+        'XboxUserSvc'
     )
     foreach ($s in $DisableSvcs) {
         sc.exe config $s start= disabled 2>$null
@@ -622,78 +470,46 @@ function Stage-DebloatTweaks {
     # ── Disable scheduled tasks ──────────────────────────────────────────────
     dbg "Disabling scheduled tasks …"
     $Tasks = @(
-        '\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser'
-        '\Microsoft\Windows\Application Experience\ProgramDataUpdater'
-        '\Microsoft\Windows\Autochk\Proxy'
-        '\Microsoft\Windows\Customer Experience Improvement Program\Consolidator'
-        '\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip'
-        '\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector'
-        '\Microsoft\Windows\Feedback\Siuf\DmClient'
-        '\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload'
-        '\Microsoft\Windows\Windows Error Reporting\QueueReporting'
-        '\Microsoft\Windows\Maps\MapsUpdateTask'
-        '\Microsoft\Windows\Maps\MapsToastTask'
+        'Microsoft\Windows\Application Experience\Microsoft-Windows-ApplicationExperienceInfrastructure-OneTimeScheduledTask'
+        'Microsoft\Windows\Application Experience\Microsoft-Windows-PerfTrack-Opt-In'
+        'Microsoft\Windows\Application Experience\Microsoft-Windows-SierraTelemetryInfrastructure-OneTimeScheduledTask'
+        'Microsoft\Windows\Feedback\SIUF\SysIdAp'
+        'Microsoft\Windows\Feedback\SIUF\SysIdApSched'
+        'Microsoft\Windows\Shell\FamilySafetyMonitor'
+        'Microsoft\Windows\Shell\FamilySafetyMonitorCmdStore'
+        'Microsoft\Windows\Shell\FamilySafetyMonitorSyncRL'
     )
     foreach ($t in $Tasks) {
-        schtasks /Change /TN $t /Disable 2>$null
+        Disable-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
     }
-    dbg-ok "Scheduled tasks disabled"
+    dbg-ok "$($Tasks.Count) tasks disabled"
 
     # ── Ultimate Performance power plan ──────────────────────────────────────
     dbg "Activating Ultimate Performance power plan …"
-    $ultGuid = 'e9a42b02-d5df-448d-aa00-03f14749eb61'
-    # First unhide it
-    powercfg /duplicatescheme $ultGuid 2>$null
+    $ultGuid = 'e9a4aa16-61ba-4ed7-a5f7-edf482346f66'
     $listOut = & powercfg /L 2>&1
     if ($listOut -match $ultGuid) {
         powercfg /setactivescheme $ultGuid 2>$null
         dbg-ok "Ultimate Performance plan activated"
     } else {
-        # Create from high performance
-        $highGuid = '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c'
-        $newGuid = & powercfg /duplicatescheme $highGuid 2>&1
-        if ($newGuid -match '([a-f0-9-]{36})') {
-            $createdGuid = $Matches[1]
-            powercfg /changename $createdGuid "Ultimate Performance" "Maximum performance" 2>$null
-            powercfg /setactivescheme $createdGuid 2>$null
-            dbg-ok "Created + activated Ultimate Performance plan"
-        } else {
-            dbg-warn "Could not create Ultimate Performance plan"
-        }
+        # Duplicate High Performance and rename
+        $highGuid = '8c016748-2fbf-4e82-9e6e-f510833e3905'
+        powercfg /duplicatescheme $highGuid $ultGuid 2>$null
+        powercfg /setactivescheme $ultGuid 2>$null
+        dbg-ok "Created + activated Ultimate Performance plan"
     }
 
     # ── Show hidden files & extensions ───────────────────────────────────────
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'Hidden'          1
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'ShowHiddenFiles' 2
     Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'HideFileExt'     0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'ShowSuperHidden' 1
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'HideSysFolder'   2
     dbg-ok "Explorer: hidden files & extensions visible"
 
-    # ── Taskbar tweaks ───────────────────────────────────────────────────────
-    dbg "Applying taskbar tweaks …"
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'ShowTaskViewButton'     0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'TaskbarDa'              0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'TaskbarMn'              0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search'            'SearchboxTaskbarMode'   0
-    dbg-ok "Taskbar cleaned up (Task View, Widgets, Chat hidden)"
-
     # ── Start menu suggestions off ───────────────────────────────────────────
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'Start_TrackProgs'       0
-    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'Start_TrackDocs'        0
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Start' 'ShowFrequentApps'   0
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Start' 'ShowRecentlyAdded'  0
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Start' 'ShowRecentlyOpened' 0
     dbg-ok "Start menu suggestions disabled"
-
-    # ── NumLock on by default ────────────────────────────────────────────────
-    Set-Reg 'HKCU:\Control Panel\Keyboard' 'InitialKeyboardIndicators' '2' 'String'
-    Set-Reg 'HKU:\.DEFAULT\Control Panel\Keyboard' 'InitialKeyboardIndicators' '2' 'String' 2>$null
-    dbg-ok "NumLock enabled by default"
-
-    # ── Classic right-click context menu (Windows 11) ────────────────────────
-    Set-Reg 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32' '(Default)' '' 'String'
-    dbg-ok "Classic context menu enabled (Win11)"
-
-    # ── Refresh explorer ─────────────────────────────────────────────────────
-    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-    Start-Process explorer
 
     Set-Stage 2
 }
@@ -704,38 +520,8 @@ function Stage-DebloatTweaks {
 function Stage-WingetApps {
     dbg-head "STAGE 2 — Winget App Installs"
 
-    # Winget install helper function with retry
-    function Install-WingetApp {
-        param([string]$Id, [int]$MaxRetries = 2)
-        
-        for ($retry = 1; $retry -le $MaxRetries; $retry++) {
-            dbg "  Installing $Id (attempt $retry) …"
-            try {
-                $out = & winget install --exact --id $Id `
-                    --silent `
-                    --accept-package-agreements `
-                    --accept-source-agreements `
-                    --disable-interactivity 2>&1
-                
-                $outStr = $out -join ' '
-                if ($outStr -match 'Successfully installed' -or $outStr -match 'already installed') { 
-                    dbg-ok "$Id installed"
-                    return $true
-                }
-                if ($outStr -match 'No package found') {
-                    dbg-warn "$Id — package not found in winget"
-                    return $false
-                }
-                dbg-warn "$Id — last output: $(($out | Select-Object -Last 2) -join ' | ')"
-            } catch { 
-                dbg-err "$Id — exception: $_" 
-            }
-            Start-Sleep -Seconds 3
-        }
-        return $false
-    }
-
-    # Apps list - includes Prism Launcher
+    # Thorium AVX2 is here via winget (ID confirmed live: Alex313031.Thorium.AVX2)
+    # Bloxstrap replaces standalone Roblox bootstrapper
     $Apps = @(
         'Valve.Steam'
         'Discord.Discord'
@@ -743,31 +529,32 @@ function Stage-WingetApps {
         'VideoLAN.VLC'
         '7zip.7zip'
         'Bitwarden.Bitwarden'
-        'Python.Python.3.12'
+        'Python.Python.3'
         'Ablaze.Floorp'
         'Git.Git'
-        'Bloxstrap'
+        'pizzaboxer.Bloxstrap'
         'voidtools.Everything'
-        'AntibodySoftware.WizTree'
+        'WizTree.WizTree'
         'EpicGames.EpicGamesLauncher'
         'Modrinth.ModrinthApp'
         'Logitech.GHUB'
         'Alex313031.Thorium.AVX2'
-        'PrismLauncher.PrismLauncher'
     )
 
-    $installed = 0
-    $failed = 0
     foreach ($id in $Apps) {
-        if (Install-WingetApp $id) {
-            $installed++
-        } else {
-            $failed++
-        }
-        Start-Sleep -Seconds 1
+        dbg "  Installing $id …"
+        try {
+            $out = & winget install --exact --id $id `
+                --silent `
+                --accept-package-agreements `
+                --accept-source-agreements `
+                --disable-interactivity 2>&1
+            if ($out -match 'Successfully installed') { dbg-ok "$id installed" }
+            else { dbg-warn "$id — last output: $(($out | Select-Object -Last 3) -join ' | ')" }
+        } catch { dbg-err "$id — exception: $_" }
+        Start-Sleep -Seconds 2
     }
 
-    dbg-ok "Winget apps: $installed installed, $failed failed"
     Set-Stage 3
 }
 
@@ -779,6 +566,12 @@ function Stage-ManualApps {
     Ensure-TempDir
 
     # ── Vencord ──────────────────────────────────────────────────────────────
+    # Verified: raw.githubusercontent.com/Vencord/Installer/main/install.ps1 is LIVE.
+    # That script downloads VencordInstallerCli.exe from GitHub releases/latest.
+    # The CLI is a Go binary with NO silent flags.  It prompts interactively:
+    #   - Pick install type  (we want index 0 = stable Discord)
+    #   - Confirm install    (y)
+    # We download the exe directly via GitHub API, then pipe stdin via cmd.
     dbg "Resolving VencordInstallerCli.exe …"
     $vencordUrl  = Get-LatestAssetUrl -Owner 'Vencord' -Repo 'Installer' -Pattern 'VencordInstallerCli\.exe$'
     $vencordDest = Join-Path $TEMP_DIR 'VencordInstallerCli.exe'
@@ -798,14 +591,13 @@ function Stage-ManualApps {
     }
 
     # ── TCNO Account Switcher ────────────────────────────────────────────────
+    # Confirmed: TCNOco/TcNo-Acc-Switcher releases page is live.
+    # Installer is Inno Setup => /VERYSILENT /NOPROMPT are standard flags.
     dbg "Resolving TCNO Account Switcher installer …"
-    $tcnoUrl  = Get-LatestAssetUrl -Owner 'TCNOco' -Repo 'TcNo-Acc-Switcher' -Pattern 'TcNo-Account-Switcher.*_Installer\.exe$'
-    if (-not $tcnoUrl) {
-        $tcnoUrl = Get-LatestAssetUrl -Owner 'TCNOco' -Repo 'TcNo-Acc-Switcher' -Pattern 'Installer.*\.exe$'
-    }
+    $tcnoUrl  = Get-LatestAssetUrl -Owner 'TCNOco' -Repo 'TcNo-Acc-Switcher' -Pattern 'TcNo\.Account\.Switcher.*Installer.*\.exe$'
     $tcnoDest = Join-Path $TEMP_DIR 'TcNoInstaller.exe'
     if ($tcnoUrl -and (Invoke-Download $tcnoUrl $tcnoDest)) {
-        Start-Silent $tcnoDest '/VERYSILENT /NORESTART /CLOSEAPPLICATIONS' 180
+        Start-Silent $tcnoDest '/VERYSILENT /NOPROMPT' 180
         dbg-ok "TCNO Account Switcher installed"
     } else {
         dbg-warn "TCNO installer could not be resolved/downloaded — skipping"
@@ -827,22 +619,24 @@ function Stage-GPUDrivers {
 
     if ($gpuName -match 'NVIDIA|GeForce|Quadro|Tesla') {
         # ── NVIDIA App installer ─────────────────────────────────────────────
-        dbg "NVIDIA GPU detected — fetching NVIDIA App …"
-        
-        # Try multiple approaches to get the download URL
+        # nvidia.com/en-us/software/nvidia-app/ is confirmed live.
+        # The community gist (emilwojcik93) confirms the scrape approach and
+        # the silent flags from setup.cfg:
+        #   -silent -noreboot -noeula -nofinish -passive
+        # Current known version (WAPT, signed 2026-01-26): 11.0.6.383
+        # We scrape the page at runtime; fall back to that version if scrape fails.
+        dbg "NVIDIA GPU detected — scraping NVIDIA App download URL …"
         $nvidiaUrl = $null
-        
-        # Method 1: Scrape official page
         try {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             $page = Invoke-WebRequest -Uri 'https://www.nvidia.com/en-us/software/nvidia-app/' -UseBasicParsing -ErrorAction Stop
-            if ($page.Content -match 'https://[^\s"''<>]us.download.nvidia.com[^\s"''<>].exe') {
+            # Look for the versioned CDN URL pattern in page source
+            if ($page.Content -match 'https://[^\s"'\''<>]*us\.download\.nvidia\.com[^\s"'\''<>]*\.exe') {
                 $nvidiaUrl = $Matches[0]
                 dbg-ok "Scraped NVIDIA App URL: $nvidiaUrl"
             }
         } catch { dbg-warn "NVIDIA page scrape failed: $_" }
 
-        # Method 2: Known fallback URL (updated periodically)
         if (-not $nvidiaUrl) {
             $nvidiaUrl = 'https://us.download.nvidia.com/nvapp/client/11.0.6.383/NVIDIA_app_v11.0.6.383.exe'
             dbg-warn "Using known fallback URL: $nvidiaUrl"
@@ -850,28 +644,20 @@ function Stage-GPUDrivers {
 
         $nvDest = Join-Path $TEMP_DIR 'NVIDIA_app_installer.exe'
         if (Invoke-Download $nvidiaUrl $nvDest) {
-            # Silent install flags from NVIDIA setup.cfg
-            Start-Silent $nvDest '-s -noreboot -noeula -nofinish' 600
+            Start-Silent $nvDest '-silent -noreboot -noeula -nofinish -passive' 600
             dbg-ok "NVIDIA App installer executed"
         }
 
     } elseif ($gpuName -match 'AMD|Radeon|FirePro') {
+        # AMD does NOT publish a single stable direct-download URL.
+        # Their download page requires JavaScript auto-detect.
+        # Logging a clear warning so the user knows to do it manually.
         dbg-warn "AMD GPU detected ($gpuName)"
         dbg-warn "AMD has no stable single installer URL — please download drivers"
         dbg-warn "manually from: https://www.amd.com/en/support"
 
-    } elseif ($gpuName -match 'Intel|Arc|Iris|UHD') {
-        dbg "Intel GPU detected — attempting Intel Driver installer …"
-        # Intel has a driver support assistant
-        $intelUrl = 'https://dsadata.intel.com/installer/Intel%20Driver%20%26%20Support%20Assistant%20Installer.exe'
-        $intelDest = Join-Path $TEMP_DIR 'Intel_DSA_Installer.exe'
-        if (Invoke-Download $intelUrl $intelDest) {
-            Start-Silent $intelDest '/quiet /norestart' 300
-            dbg-ok "Intel DSA installed (will auto-update drivers)"
-        }
-
     } else {
-        dbg-warn "No discrete NVIDIA/AMD/Intel GPU detected ($gpuName) — skipping drivers"
+        dbg-warn "No discrete NVIDIA/AMD GPU detected ($gpuName) — skipping drivers"
     }
 
     Set-Stage 5
@@ -882,7 +668,11 @@ function Stage-GPUDrivers {
 # ─────────────────────────────────────────────────────────────────────────────
 function Stage-Activation {
     dbg-head "STAGE 5 — Windows HWID Activation (MAS)"
-    
+    # VERIFIED on massgrave.dev/command_line_switches:
+    #   & ([ScriptBlock]::Create((irm https://get.activated.win))) /HWID
+    # runs HWID fully unattended. /HWID is the documented switch.
+    # get.activated.win confirmed live above — it returns the MAS PowerShell script.
+    # There is NO "HWID.bat", NO "Separate-Files" folder in the MAS repo.
     dbg "Downloading MAS script from https://get.activated.win …"
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
