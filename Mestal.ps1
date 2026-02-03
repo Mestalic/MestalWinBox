@@ -836,7 +836,7 @@ function Stage-GPUDrivers {
         try {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             $page = Invoke-WebRequest -Uri 'https://www.nvidia.com/en-us/software/nvidia-app/' -UseBasicParsing -ErrorAction Stop
-            if ($page.Content -match 'https://[^\s"'\''<>]*us\.download\.nvidia\.com[^\s"'\''<>]*NVIDIA_app[^\s"'\''<>]*\.exe') {
+            if ($page.Content -match 'https://[^\s"''<>]us.download.nvidia.com[^\s"''<>].exe') {
                 $nvidiaUrl = $Matches[0]
                 dbg-ok "Scraped NVIDIA App URL: $nvidiaUrl"
             }
