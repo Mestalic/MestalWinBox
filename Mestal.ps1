@@ -551,7 +551,7 @@ function Stage-WingetApps {
     }
 
     $apps = @('Valve.Steam','Discord.Discord','Spotify.Spotify','VideoLAN.VLC','7zip.7zip','Bitwarden.Bitwarden',
-              'Python.Python.3.12','Ablaze.Floorp','Git.Git','Bloxstrap','voidtools.Everything',
+              'Python.Python.3.12','Ablaze.Floorp','Git.Git','pizzaboxer.Bloxstrap','voidtools.Everything',
               'AntibodySoftware.WizTree','EpicGames.EpicGamesLauncher','Modrinth.ModrinthApp',
               'Logitech.GHUB','Alex313031.Thorium.AVX2','PrismLauncher.PrismLauncher')
 
