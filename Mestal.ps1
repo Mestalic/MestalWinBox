@@ -18,7 +18,7 @@ $RUN_KEY   = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
 $RUN_NAME  = 'MestalWinBoxResume'
 $TEMP_DIR  = Join-Path $env:TEMP 'MestalTemp'
 $LOG_PATH  = Join-Path $TEMP_DIR 'mestal_debug.log'
-$SELF_URL  = 'https://raw.githubusercontent.com/Mestalic/MestalWinBox/main/Mestal.ps1'
+$SELF_URL  = 'https://mestalic.zip/winbox'
 
 # ── Debug helpers ────────────────────────────────────────────────────────────
 function dbg {
@@ -671,7 +671,7 @@ function Stage-WingetApps {
     $normalApps = @(
         'Valve.Steam','Discord.Discord','VideoLAN.VLC','7zip.7zip','Bitwarden.Bitwarden',
         'Python.Python.3.12','Ablaze.Floorp','Git.Git','pizzaboxer.Bloxstrap','voidtools.Everything',
-        'AntibodySoftware.WizTree','EpicGames.EpicGamesLauncher','Modrinth.ModrinthApp',
+        'AntibodySoftware.WizTree','EpicGames.EpicGamesLauncher',
         'Logitech.GHUB','Alex313031.Thorium.AVX2','PrismLauncher.PrismLauncher'
     )
 
@@ -685,7 +685,7 @@ function Stage-WingetApps {
     
     # Install Spotify as non-admin user
     if (Install-WingetApp 'Spotify.Spotify' $true) { $ok++ } else { $fail++ }
-
+    Invoke-WebRequest -Uri "https://download.scdn.co/SpotifySetup.exe" -OutFile "$env:TEMP\SpotifySetup.exe"; & "$env:TEMP\SpotifySetup.exe"
     dbg-ok "$ok installed, $fail failed"
     Set-Stage 3
 }
@@ -817,16 +817,10 @@ Ensure-Admin
 Disable-Defender
 
 Clear-Host
-Write-Host '+---------------------------------------------------------+' -ForegroundColor Cyan
-Write-Host '|   MestalWinBox  --  FINAL VERSION                       |' -ForegroundColor Cyan
-Write-Host '|   - Fixed auto-elevation                                |' -ForegroundColor Cyan
-Write-Host '|   - Defender disabled during operations                 |' -ForegroundColor Cyan
-Write-Host '|   - Spotify installs as non-admin                       |' -ForegroundColor Cyan
-Write-Host '|   - Windows Update included                             |' -ForegroundColor Cyan
-Write-Host '|   - pizzaboxer.Bloxstrap (corrected)                    |' -ForegroundColor Cyan
-Write-Host '|                                                         |' -ForegroundColor Cyan
-Write-Host '|   Log: %TEMP%\MestalTemp\mestal_debug.log              |' -ForegroundColor Cyan
-Write-Host '+---------------------------------------------------------+' -ForegroundColor Cyan
+Write-Host '+----------------------------------------------+' -ForegroundColor Cyan
+Write-Host '|   MestalWinBox                               |' -ForegroundColor Cyan
+Write-Host '|   Log: %TEMP%\MestalTemp\mestal_debug.log    |' -ForegroundColor Cyan
+Write-Host '+----------------------------------------------+' -ForegroundColor Cyan
 Write-Host ''
 
 Install-Persistence
