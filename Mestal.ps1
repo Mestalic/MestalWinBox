@@ -711,12 +711,13 @@ function Stage-ManualApps {
         } catch { dbg-err "Vencord failed: $_" }
     }
 
-    # TCNO
+
     $tUrl = Get-LatestAssetUrl -Owner 'TCNOco' -Repo 'TcNo-Acc-Switcher' -Pattern 'Installer.*\.exe$'
     $tDest = Join-Path $TEMP_DIR 'TcNoInstaller.exe'
+
     if ($tUrl -and (Invoke-Download $tUrl $tDest)) {
-        Start-Silent $tDest '/VERYSILENT /NORESTART' 180
-        dbg-ok "TCNO installed"
+            Start-Process -FilePath $tDest -ArgumentList '/VERYSILENT','/NORESTART' -Wait -NoNewWindow
+            dbg-ok "TCNO installed"
     }
 
     Set-Stage 4
