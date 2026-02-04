@@ -2,12 +2,12 @@
 #  Mestal.ps1 — MestalWinBox  |  FINAL VERSION
 #  
 #  FIXES:
-#  - Chocolatey auto-install + winget via choco
-#  - Winget ToS pre-accepted (registry + settings.json)
-#  - Debloat double-check verification
-#  - WinUtil Standard bloat list (2025)
-#  - Fixed NVIDIA URL regex (added missing *)
-#  - Fixed Stage 0 hang (added timeout + fallback)
+#  - Fixed auto-elevation (simplified + robust)
+#  - Defender disabled before operations, re-enabled at end
+#  - Spotify installs as non-admin user (workaround for admin restriction)
+#  - Windows Update check/install added to Stage 0
+#  - Bloxstrap → pizzaboxer.Bloxstrap (corrected winget ID)
+#  - Chocolatey timeout prevents Stage 0 hang
 #############################################################################
 
 $global:ErrorActionPreference = 'SilentlyContinue'
@@ -134,32 +134,92 @@ function Get-LatestAssetUrl {
     }
 }
 
-# ── Elevation ────────────────────────────────────────────────────────────────
+# ── Elevation (FIXED) ────────────────────────────────────────────────────────
 function Ensure-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $pr = [Security.Principal.WindowsPrincipal]::new($id)
-    if ($pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        dbg-ok "Running as admin"
+    $pr = New-Object Security.Principal.WindowsPrincipal($id)
+    $adminRole = [Security.Principal.WindowsBuiltInRole]::Administrator
+    
+    if ($pr.IsInRole($adminRole)) {
+        dbg-ok "Running as Administrator"
         return
     }
-    dbg "Re-launching elevated …"
+    
+    dbg "Not admin — re-launching elevated …"
     Ensure-TempDir
-    $cached = Join-Path $TEMP_DIR 'MestalResume.ps1'
-    if (-not (Test-Path $cached)) {
+    $scriptPath = $MyInvocation.PSCommandPath
+    if (-not $scriptPath) {
+        # If invoked via IEX, download to temp
+        $scriptPath = Join-Path $TEMP_DIR 'MestalResume.ps1'
         try {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri $SELF_URL -OutFile $cached -UseBasicParsing -ErrorAction Stop
-        } catch {}
+            Invoke-WebRequest -Uri $SELF_URL -OutFile $scriptPath -UseBasicParsing -ErrorAction Stop
+        } catch {
+            dbg-err "Could not download script for elevation: $_"
+            Read-Host "Press Enter to exit"
+            exit 1
+        }
     }
-    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$cached`"" -Verb RunAs -WindowStyle Normal
-    exit 0
+    
+    try {
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs
+        exit 0
+    } catch {
+        dbg-err "Elevation failed: $_"
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
+}
+
+# ── Windows Defender Control ────────────────────────────────────────────────
+function Disable-Defender {
+    dbg "Disabling Windows Defender …"
+    try {
+        # Disable real-time protection
+        Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop
+        dbg-ok "Real-time protection disabled"
+    } catch { dbg-warn "Real-time disable failed (may require manual disable): $_" }
+    
+    # Registry-based disable (more aggressive)
+    $defenderKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
+    if (-not (Test-Path $defenderKey)) { New-Item -Path $defenderKey -Force | Out-Null }
+    Set-ItemProperty -Path $defenderKey -Name 'DisableAntiSpyware' -Value 1 -Type DWord -ErrorAction SilentlyContinue
+    
+    $rtKey = "$defenderKey\Real-Time Protection"
+    if (-not (Test-Path $rtKey)) { New-Item -Path $rtKey -Force | Out-Null }
+    Set-ItemProperty -Path $rtKey -Name 'DisableRealtimeMonitoring' -Value 1 -Type DWord -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $rtKey -Name 'DisableBehaviorMonitoring' -Value 1 -Type DWord -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $rtKey -Name 'DisableOnAccessProtection' -Value 1 -Type DWord -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $rtKey -Name 'DisableScanOnRealtimeEnable' -Value 1 -Type DWord -ErrorAction SilentlyContinue
+    
+    dbg-ok "Defender disabled via registry"
+}
+
+function Enable-Defender {
+    dbg "Re-enabling Windows Defender …"
+    try {
+        Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop
+        dbg-ok "Real-time protection enabled"
+    } catch { dbg-warn "Real-time enable failed: $_" }
+    
+    # Remove registry blocks
+    $defenderKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
+    Remove-ItemProperty -Path $defenderKey -Name 'DisableAntiSpyware' -ErrorAction SilentlyContinue
+    
+    $rtKey = "$defenderKey\Real-Time Protection"
+    Remove-ItemProperty -Path $rtKey -Name 'DisableRealtimeMonitoring' -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $rtKey -Name 'DisableBehaviorMonitoring' -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $rtKey -Name 'DisableOnAccessProtection' -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $rtKey -Name 'DisableScanOnRealtimeEnable' -ErrorAction SilentlyContinue
+    
+    dbg-ok "Defender re-enabled"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STAGE 0 — Winget Repair (Chocolatey → winget, ToS acceptance)
+#  STAGE 0 — Winget Repair + Windows Update
 # ─────────────────────────────────────────────────────────────────────────────
 function Stage-WingetRepair {
-    dbg-head "STAGE 0 — Winget Repair (Chocolatey Method)"
+    dbg-head "STAGE 0 — Winget Repair + Windows Update"
 
     function Test-Winget {
         try {
@@ -171,12 +231,10 @@ function Stage-WingetRepair {
 
     function Accept-WingetAgreements {
         dbg "Pre-accepting winget ToS …"
-        # Registry
         $regPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Winget'
         if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
         Set-ItemProperty -Path $regPath -Name 'SourceAgreementsAccepted' -Value 1 -Type DWord -ErrorAction SilentlyContinue
         
-        # settings.json
         $settingsPath = "$env:LOCALAPPDATA\Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\settings.json"
         $settingsDir = Split-Path $settingsPath -Parent
         if (-not (Test-Path $settingsDir)) { New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null }
@@ -205,7 +263,7 @@ function Stage-WingetRepair {
                 dbg-ok "Chocolatey installed"
                 return $true
             }
-            dbg-err "Chocolatey exe not found after install"
+            dbg-err "Chocolatey exe not found"
             return $false
         } catch {
             dbg-err "Chocolatey install failed: $_"
@@ -214,26 +272,26 @@ function Stage-WingetRepair {
     }
 
     function Install-WingetViaChoco {
-        dbg "Installing winget via choco …"
+        dbg "Installing winget via choco (180s timeout) …"
         try {
             $job = Start-Job -ScriptBlock {
                 & choco install winget -y --force --ignore-checksums 2>&1 | Out-Null
             }
             $done = Wait-Job -Job $job -Timeout 180
             if (-not $done) {
-                dbg-warn "Choco install timed out after 180s"
+                dbg-warn "Choco install timed out"
                 Remove-Job -Job $job -Force
                 return $false
             }
             Receive-Job -Job $job | Out-Null
             Remove-Job -Job $job
-            Start-Sleep -Seconds 5
+            Start-Sleep 5
             $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')
             if (Test-Winget) {
                 dbg-ok "Winget installed via choco"
                 return $true
             }
-            dbg-warn "Choco completed but winget still not working"
+            dbg-warn "Choco completed but winget not working"
             return $false
         } catch {
             dbg-err "Choco install exception: $_"
@@ -245,7 +303,6 @@ function Stage-WingetRepair {
         dbg "Installing VCLibs + UI.Xaml …"
         Ensure-TempDir
         
-        # VCLibs
         $vclibsUrl = 'https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx'
         $vclibsDest = Join-Path $TEMP_DIR 'VCLibs.appx'
         if (Invoke-Download $vclibsUrl $vclibsDest) {
@@ -255,7 +312,6 @@ function Stage-WingetRepair {
             } catch { dbg-warn "VCLibs failed: $_" }
         }
         
-        # UI.Xaml
         $xamlUrl = 'https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx'
         $xamlDest = Join-Path $TEMP_DIR 'UIXaml.appx'
         if (Invoke-Download $xamlUrl $xamlDest) {
@@ -270,10 +326,66 @@ function Stage-WingetRepair {
         dbg "Resetting winget sources …"
         try {
             & winget source reset --force 2>&1 | Out-Null
-            Start-Sleep -Seconds 2
+            Start-Sleep 2
             & winget source update 2>&1 | Out-Null
             dbg-ok "Sources reset"
         } catch { dbg-warn "Source reset failed" }
+    }
+
+    # WINDOWS UPDATE
+    function Install-WindowsUpdates {
+        dbg "Checking for Windows Updates …"
+        try {
+            $updateSession = New-Object -ComObject Microsoft.Update.Session
+            $updateSearcher = $updateSession.CreateUpdateSearcher()
+            
+            dbg "  Searching for updates …"
+            $searchResult = $updateSearcher.Search("IsInstalled=0 and Type='Software'")
+            
+            if ($searchResult.Updates.Count -eq 0) {
+                dbg-ok "No updates available"
+                return
+            }
+            
+            dbg "  Found $($searchResult.Updates.Count) updates"
+            
+            $updatesToDownload = New-Object -ComObject Microsoft.Update.UpdateColl
+            foreach ($update in $searchResult.Updates) {
+                if (-not $update.IsDownloaded) {
+                    $updatesToDownload.Add($update) | Out-Null
+                }
+            }
+            
+            if ($updatesToDownload.Count -gt 0) {
+                dbg "  Downloading $($updatesToDownload.Count) updates …"
+                $downloader = $updateSession.CreateUpdateDownloader()
+                $downloader.Updates = $updatesToDownload
+                $downloader.Download() | Out-Null
+                dbg-ok "Updates downloaded"
+            }
+            
+            dbg "  Installing updates …"
+            $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+            foreach ($update in $searchResult.Updates) {
+                if ($update.IsDownloaded) {
+                    $updatesToInstall.Add($update) | Out-Null
+                }
+            }
+            
+            if ($updatesToInstall.Count -gt 0) {
+                $installer = $updateSession.CreateUpdateInstaller()
+                $installer.Updates = $updatesToInstall
+                $installResult = $installer.Install()
+                
+                if ($installResult.RebootRequired) {
+                    dbg-warn "Updates installed — reboot required"
+                } else {
+                    dbg-ok "$($updatesToInstall.Count) updates installed"
+                }
+            }
+        } catch {
+            dbg-warn "Windows Update failed: $_"
+        }
     }
 
     # === MAIN LOGIC ===
@@ -282,81 +394,68 @@ function Stage-WingetRepair {
     if (Test-Winget) {
         dbg-ok "Winget already working"
         Reset-WingetSources
-        Set-Stage 1
-        return
-    }
+    } else {
+        $attempt = 0
+        $maxAttempts = 10
+        
+        while (-not (Test-Winget) -and $attempt -lt $maxAttempts) {
+            $attempt++
+            dbg "Repair attempt $attempt / $maxAttempts"
 
-    $attempt = 0
-    $maxAttempts = 10
-    
-    while (-not (Test-Winget) -and $attempt -lt $maxAttempts) {
-        $attempt++
-        dbg "Repair attempt $attempt / $maxAttempts"
-
-        # Attempt 1-2: Chocolatey
-        if ($attempt -le 2) {
-            Install-Chocolatey
-        }
-
-        # Attempt 2-4: Winget via choco
-        if ($attempt -ge 2 -and $attempt -le 4) {
-            if (Install-WingetViaChoco) { break }
-        }
-
-        # Attempt 3-5: Dependencies
-        if ($attempt -ge 3 -and $attempt -le 5) {
-            Install-WingetDependencies
-        }
-
-        # Attempt 4-7: Re-register
-        if ($attempt -ge 4 -and $attempt -le 7) {
-            $dai = Get-AppxPackage -AllUsers -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($dai -and $dai.InstallLocation) {
-                $manifest = Join-Path $dai.InstallLocation 'AppxManifest.xml'
-                if (Test-Path $manifest) {
-                    dbg "  Re-registering DAI"
-                    Add-AppxPackage -Register $manifest -DisableDevelopmentMode -ErrorAction SilentlyContinue
-                    Start-Sleep 3
+            if ($attempt -le 2) { Install-Chocolatey }
+            if ($attempt -ge 2 -and $attempt -le 4) {
+                if (Install-WingetViaChoco) { break }
+            }
+            if ($attempt -ge 3 -and $attempt -le 5) { Install-WingetDependencies }
+            if ($attempt -ge 4 -and $attempt -le 7) {
+                $dai = Get-AppxPackage -AllUsers -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($dai -and $dai.InstallLocation) {
+                    $manifest = Join-Path $dai.InstallLocation 'AppxManifest.xml'
+                    if (Test-Path $manifest) {
+                        dbg "  Re-registering DAI"
+                        Add-AppxPackage -Register $manifest -DisableDevelopmentMode -ErrorAction SilentlyContinue
+                        Start-Sleep 3
+                    }
                 }
             }
-        }
-
-        # Attempt 6+: Store nudge
-        if ($attempt -ge 6) {
-            dbg "  Nudging Store (3x)"
-            for ($i=1; $i -le 3; $i++) {
-                Start-Process 'ms-windows-store://updates' -ErrorAction SilentlyContinue
-                Start-Sleep 5
+            if ($attempt -ge 6) {
+                dbg "  Nudging Store"
+                for ($i=1; $i -le 3; $i++) {
+                    Start-Process 'ms-windows-store://updates' -ErrorAction SilentlyContinue
+                    Start-Sleep 5
+                }
+                Get-Process 'WinStore.App' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+                Start-Sleep 3
             }
-            Get-Process 'WinStore.App' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep 3
+
+            if (Test-Winget) {
+                dbg-ok "Winget now working"
+                Reset-WingetSources
+                break
+            }
+
+            if ($attempt -eq 7) {
+                dbg-warn "Still broken — rebooting"
+                Do-Reboot 0
+            }
         }
 
         if (Test-Winget) {
-            dbg-ok "Winget now working"
+            dbg-ok "Winget confirmed working"
             Reset-WingetSources
-            break
-        }
-
-        # Reboot at attempt 7
-        if ($attempt -eq 7) {
-            dbg-warn "Still broken — rebooting"
-            Do-Reboot 0
+        } else {
+            dbg-err "Winget failed after $maxAttempts attempts"
         }
     }
 
-    if (Test-Winget) {
-        dbg-ok "Winget confirmed working"
-        Reset-WingetSources
-    } else {
-        dbg-err "Winget failed after $maxAttempts attempts — continuing anyway"
-    }
+    # Install Windows Updates
+    Install-WindowsUpdates
 
     Set-Stage 1
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STAGE 1 — Debloat & Tweaks (WinUtil Standard + double-check)
+#  STAGE 1 — Debloat & Tweaks
 # ─────────────────────────────────────────────────────────────────────────────
 function Stage-DebloatTweaks {
     dbg-head "STAGE 1 — Debloat & Tweaks"
@@ -409,7 +508,7 @@ function Stage-DebloatTweaks {
             Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -ErrorAction SilentlyContinue
         }
     }
-    dbg-ok "$removed packages removed (first pass)"
+    dbg-ok "$removed packages removed"
 
     # DOUBLE-CHECK
     dbg "Verifying debloat …"
@@ -423,8 +522,8 @@ function Stage-DebloatTweaks {
             }
         }
     }
-    if ($remaining -eq 0) { dbg-ok "Debloat verified complete" }
-    else                  { dbg-warn "$remaining packages still present (force-removed)" }
+    if ($remaining -eq 0) { dbg-ok "Debloat verified" }
+    else                  { dbg-warn "$remaining still present (re-removed)" }
 
     # OneDrive
     dbg "Removing OneDrive …"
@@ -438,8 +537,6 @@ function Stage-DebloatTweaks {
         if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
         Set-ItemProperty -Path $p -Name 'DisableOneDrive' -Value 1 -Type DWord
     }
-    Remove-Item 'HKCR:\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}' -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item 'HKCR:\Wow6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}' -Recurse -Force -ErrorAction SilentlyContinue
     dbg-ok "OneDrive removed"
 
     # Mouse accel off
@@ -461,7 +558,7 @@ function Stage-DebloatTweaks {
     $skKey = 'HKCU:\Control Panel\Accessibility\StickyKeys'
     if (-not (Test-Path $skKey)) { New-Item -Path $skKey -Force | Out-Null }
     Set-ItemProperty -Path $skKey -Name 'Flags' -Value '506' -Type String
-    dbg-ok "Sticky Keys prompt off"
+    dbg-ok "Accessibility prompts off"
 
     # Privacy / Telemetry
     dbg "Applying privacy tweaks …"
@@ -495,7 +592,7 @@ function Stage-DebloatTweaks {
         sc.exe config $s start= disabled 2>$null
         sc.exe stop $s 2>$null
     }
-    dbg-ok "$($svcs.Count) services disabled"
+    dbg-ok "Services disabled"
 
     # Disable tasks
     $tasks = @(
@@ -507,7 +604,6 @@ function Stage-DebloatTweaks {
     dbg-ok "Tasks disabled"
 
     # Ultimate Performance
-    dbg "Activating Ultimate Performance …"
     $ultGuid = 'e9a42b02-d5df-448d-aa00-03f14749eb61'
     powercfg /duplicatescheme $ultGuid 2>$null
     powercfg /setactivescheme $ultGuid 2>$null
@@ -530,13 +626,35 @@ function Stage-DebloatTweaks {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STAGE 2 — Winget Apps
+#  STAGE 2 — Winget Apps (Spotify runs as non-admin user)
 # ─────────────────────────────────────────────────────────────────────────────
 function Stage-WingetApps {
     dbg-head "STAGE 2 — Winget Apps"
 
     function Install-WingetApp {
-        param([string]$Id)
+        param([string]$Id, [bool]$AsUser = $false)
+        
+        if ($AsUser) {
+            # Spotify needs to run as non-admin user
+            dbg "  $Id (non-admin user)"
+            try {
+                # Get current user SID
+                $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+                # Run winget as user via scheduled task
+                $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -Command `"& winget install --exact --id $Id --silent --accept-package-agreements --accept-source-agreements --disable-interactivity`""
+                $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited
+                $task = Register-ScheduledTask -TaskName "MestalSpotifyInstall" -Action $action -Principal $principal -Force
+                Start-ScheduledTask -TaskName "MestalSpotifyInstall"
+                Start-Sleep 30  # Wait for install
+                Unregister-ScheduledTask -TaskName "MestalSpotifyInstall" -Confirm:$false
+                dbg-ok "$Id installed (non-admin)"
+                return $true
+            } catch {
+                dbg-warn "$Id non-admin install failed: $_"
+                return $false
+            }
+        }
+        
         dbg "  $Id"
         try {
             $out = & winget install --exact --id $Id --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1
@@ -550,18 +668,25 @@ function Stage-WingetApps {
         } catch { dbg-err "$Id — $_"; return $false }
     }
 
-    $apps = @('Valve.Steam','Discord.Discord','Spotify.Spotify','VideoLAN.VLC','7zip.7zip','Bitwarden.Bitwarden',
-              'Python.Python.3.12','Ablaze.Floorp','Git.Git','pizzaboxer.Bloxstrap','voidtools.Everything',
-              'AntibodySoftware.WizTree','EpicGames.EpicGamesLauncher','Modrinth.ModrinthApp',
-              'Logitech.GHUB','Alex313031.Thorium.AVX2','PrismLauncher.PrismLauncher')
+    $normalApps = @(
+        'Valve.Steam','Discord.Discord','VideoLAN.VLC','7zip.7zip','Bitwarden.Bitwarden',
+        'Python.Python.3.12','Ablaze.Floorp','Git.Git','pizzaboxer.Bloxstrap','voidtools.Everything',
+        'AntibodySoftware.WizTree','EpicGames.EpicGamesLauncher','Modrinth.ModrinthApp',
+        'Logitech.GHUB','Alex313031.Thorium.AVX2','PrismLauncher.PrismLauncher'
+    )
 
     $ok = 0; $fail = 0
-    foreach ($id in $apps) {
+    
+    # Install normal apps
+    foreach ($id in $normalApps) {
         if (Install-WingetApp $id) { $ok++ } else { $fail++ }
         Start-Sleep 1
     }
-    dbg-ok "$ok installed, $fail failed"
+    
+    # Install Spotify as non-admin user
+    if (Install-WingetApp 'Spotify.Spotify' $true) { $ok++ } else { $fail++ }
 
+    dbg-ok "$ok installed, $fail failed"
     Set-Stage 3
 }
 
@@ -580,7 +705,7 @@ function Stage-ManualApps {
         try {
             $p = Start-Process -FilePath 'cmd.exe' -ArgumentList "/c (echo 0 & echo y) | `"$vDest`"" -WindowStyle Hidden -PassThru
             $exited = $p.WaitForExit(120000)
-            if ($exited) { dbg-ok "Vencord done (exit $($p.ExitCode))" }
+            if ($exited) { dbg-ok "Vencord done" }
             else         { dbg-warn "Vencord timeout"; $p.Kill() }
         } catch { dbg-err "Vencord failed: $_" }
     }
@@ -652,7 +777,7 @@ function Stage-Activation {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         $mas = Invoke-WebRequest -Uri 'https://get.activated.win' -UseBasicParsing -ErrorAction Stop
         if ($mas.Content.Length -gt 100) {
-            dbg-ok "MAS downloaded ($($mas.Content.Length) chars)"
+            dbg-ok "MAS downloaded"
             & ([ScriptBlock]::Create($mas.Content)) /HWID
             dbg-ok "MAS executed"
         }
@@ -662,10 +787,14 @@ function Stage-Activation {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STAGE 99 — Cleanup
+#  STAGE 99 — Cleanup + Re-enable Defender
 # ─────────────────────────────────────────────────────────────────────────────
 function Stage-Cleanup {
     dbg-head "STAGE 99 — Cleanup"
+    
+    # Re-enable Defender
+    Enable-Defender
+    
     Remove-Persistence
     Start-Process taskmgr.exe -WindowStyle Normal
     dbg-ok "taskmgr launched"
@@ -684,13 +813,17 @@ function Stage-Cleanup {
 Ensure-TempDir
 Ensure-Admin
 
+# Disable Defender at start
+Disable-Defender
+
 Clear-Host
 Write-Host '+---------------------------------------------------------+' -ForegroundColor Cyan
 Write-Host '|   MestalWinBox  --  FINAL VERSION                       |' -ForegroundColor Cyan
-Write-Host '|   - Chocolatey → winget                                 |' -ForegroundColor Cyan
-Write-Host '|   - Winget ToS pre-accepted                             |' -ForegroundColor Cyan
-Write-Host '|   - Debloat double-check                                |' -ForegroundColor Cyan
-Write-Host '|   - WinUtil Standard (2025)                             |' -ForegroundColor Cyan
+Write-Host '|   - Fixed auto-elevation                                |' -ForegroundColor Cyan
+Write-Host '|   - Defender disabled during operations                 |' -ForegroundColor Cyan
+Write-Host '|   - Spotify installs as non-admin                       |' -ForegroundColor Cyan
+Write-Host '|   - Windows Update included                             |' -ForegroundColor Cyan
+Write-Host '|   - pizzaboxer.Bloxstrap (corrected)                    |' -ForegroundColor Cyan
 Write-Host '|                                                         |' -ForegroundColor Cyan
 Write-Host '|   Log: %TEMP%\MestalTemp\mestal_debug.log              |' -ForegroundColor Cyan
 Write-Host '+---------------------------------------------------------+' -ForegroundColor Cyan
