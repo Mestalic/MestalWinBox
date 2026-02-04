@@ -1,14 +1,3 @@
-#############################################################################
-#  Mestal.ps1 — MestalWinBox  |  FINAL VERSION
-#  
-#  FIXES:
-#  - Fixed auto-elevation (simplified + robust)
-#  - Defender disabled before operations, re-enabled at end
-#  - Spotify installs as non-admin user (workaround for admin restriction)
-#  - Windows Update check/install added to Stage 0
-#  - Bloxstrap → pizzaboxer.Bloxstrap (corrected winget ID)
-#  - Chocolatey timeout prevents Stage 0 hang
-#############################################################################
 
 $global:ErrorActionPreference = 'SilentlyContinue'
 
