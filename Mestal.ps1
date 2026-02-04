@@ -685,8 +685,8 @@ function Stage-WingetApps {
     
     # Install Spotify as non-admin user
     if (Install-WingetApp 'Spotify.Spotify' $true) { $ok++ } else { $fail++ }
-    Invoke-WebRequest -Uri "https://download.scdn.co/SpotifySetup.exe" -OutFile "$env:TEMP\SpotifySetup.exe"; & "$env:TEMP\SpotifySetup.exe"
-    Invoke-WebRequest -Uri "https://download01.logi.com/web/ftp/pub/techsupport/gaming/lghub_installer.exe" -OutFile "$env:TEMP\LogiHubSetup.exe"; & "$env:TEMP\LogiHubSetup.exe"
+    Start-Process powershell -ArgumentList "-NoProfile -Command","Invoke-WebRequest -Uri 'https://download.scdn.co/SpotifySetup.exe' -OutFile '$env:TEMP\SpotifySetup.exe'; & '$env:TEMP\SpotifySetup.exe'" -Verb RunAsUser
+    Start-Process powershell -ArgumentList "-NoProfile -Command","Invoke-WebRequest -Uri 'https://download01.logi.com/web/ftp/pub/techsupport/gaming/lghub_installer.exe' -OutFile '$env:TEMP\LogiHubSetup.exe'; & '$env:TEMP\LogiHubSetup.exe'" -Verb RunAsUser
     dbg-ok "$ok installed, $fail failed"
     Set-Stage 3
 }
