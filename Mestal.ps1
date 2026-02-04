@@ -796,6 +796,7 @@ function Stage-Cleanup {
         }
     } catch {}
     dbg-ok "Done. Log: $LOG_PATH"
+    Start-Process powershell -ArgumentList "-NoProfile -Command","shutdown /r /t 5" -Verb RunAsUser
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
